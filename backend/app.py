@@ -199,62 +199,56 @@ def get_transactions():
 @app.route("/plaid/link")
 def plaid_link_page():
     user_id = request.args.get("user_id", "default_user")
-    return f"""
+    html = """
     <!DOCTYPE html>
     <html>
     <head>
         <title>Connect Bank - EverNest</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #23272D; color: #96abff;
-                   display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-            #status {{ font-size: 20px; text-align: center; }}
-            #btn {{ background: #029CFF; color: #000; border: none; padding: 12px 28px;
-                   border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 20px; }}
+            body { font-family: Arial, sans-serif; background: #23272D; color: #96abff;
+                   display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+            #status { font-size: 20px; text-align: center; }
         </style>
     </head>
     <body>
-        <div id="status">
-            <p>Loading Plaid...</p>
-            <button id="btn" style="display:none" onclick="handler.open()">Connect Bank Account</button>
-        </div>
+        <div id="status"><p>Loading Plaid...</p></div>
         <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
         <script>
-            const userId = "{user_id}";
-            fetch("/plaid/create_link_token", {{
+            const userId = \"""" + user_id + """\";
+            fetch("/plaid/create_link_token", {
                 method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{user_id: userId}})
-            }})
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({user_id: userId})
+            })
             .then(r => r.json())
-            .then(data => {{
-                const handler = Plaid.create({{
+            .then(data => {
+                const handler = Plaid.create({
                     token: data.link_token,
-                    onSuccess: function(public_token, metadata) {{
+                    onSuccess: function(public_token, metadata) {
                         document.getElementById("status").innerHTML = "<p>Linking account...</p>";
-                        fetch("/plaid/exchange_token", {{
+                        fetch("/plaid/exchange_token", {
                             method: "POST",
-                            headers: {{"Content-Type": "application/json"}},
-                            body: JSON.stringify({{public_token: public_token, user_id: userId}})
-                        }})
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({public_token: public_token, user_id: userId})
+                        })
                         .then(r => r.json())
-                        .then(() => {{
+                        .then(() => {
                             document.getElementById("status").innerHTML =
-                                "<p style='color:#4CFF7A'>✓ Bank connected successfully!<br><br>You can close this tab and click Refresh in EverNest.</p>";
-                        }});
-                    }},
-                    onExit: function() {{
+                                "<p style='color:#4CFF7A'>✓ Bank connected! Close this tab and click Refresh in EverNest.</p>";
+                        });
+                    },
+                    onExit: function() {
                         document.getElementById("status").innerHTML =
-                            "<p>Connection cancelled.<br>Close this tab and try again.</p>";
-                    }}
-                }});
-                window.handler = handler;
+                            "<p>Cancelled. Close this tab and try again.</p>";
+                    }
+                });
                 handler.open();
-                document.getElementById("btn").style.display = "inline-block";
-            }});
+            });
         </script>
     </body>
     </html>
-    """, 200, {{"Content-Type": "text/html"}}
+    """
+    return html, 200, {"Content-Type": "text/html"}
 
 
 if __name__ == "__main__":
