@@ -256,15 +256,6 @@ def plaid_link_page():
     """
     return html, 200, {"Content-Type": "text/html"}
 
-@app.route("/migrate")
-def migrate():
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(db.text("ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS plaid_access_token VARCHAR(255);"))
-            conn.commit()
-        return "Migration successful", 200
-    except Exception as e:
-        return str(e), 400
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
