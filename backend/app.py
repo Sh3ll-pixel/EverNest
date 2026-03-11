@@ -35,7 +35,6 @@ class User(db.Model):
     plaid_access_token = db.Column(db.String(255), nullable=True)
 
 with app.app_context():
-    db.drop_all()
     db.create_all()
 
 # ── Plaid client setup ────────────────────────────────────────────────────────
