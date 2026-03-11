@@ -42,9 +42,8 @@ PLAID_SECRET    = os.getenv("PLAID_SECRET")
 PLAID_ENV       = os.getenv("PLAID_ENV", "sandbox")
 
 _env_map = {
-    "sandbox":     plaid.Environment.Sandbox,
-    "development": plaid.Environment.Development,
-    "production":  plaid.Environment.Production,
+    "sandbox":    plaid.Environment.Sandbox,
+    "production": plaid.Environment.Production,
 }
 
 configuration = plaid.Configuration(
