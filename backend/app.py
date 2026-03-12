@@ -323,6 +323,13 @@ def plaid_link_page():
     """
     return html, 200, {"Content-Type": "text/html"}
 
+@app.route("/migrate_calendar")
+def migrate_calendar():
+    try:
+        db.create_all()
+        return "Calendar table created successfully", 200
+    except Exception as e:
+        return str(e), 400
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
