@@ -37,6 +37,73 @@ class User(db.Model):
 with app.app_context():
     db.create_all()
 
+# ── Calendar Integration ──────────────────────────────────────────────────────
+# ── Calendar model ────────────────────────────────────────────────────────────
+# Add this class alongside your User model
+
+class CalendarEvent(db.Model):
+    id            = db.Column(db.Integer, primary_key=True)
+    user_id       = db.Column(db.String(80), nullable=False)
+    title         = db.Column(db.String(200), nullable=False)
+    event_date    = db.Column(db.String(10), nullable=False)   # YYYY-MM-DD
+    event_type    = db.Column(db.String(50), default="Other")
+    event_time    = db.Column(db.String(20), nullable=True)
+    notify_before = db.Column(db.String(20), default="None")
+    note          = db.Column(db.String(500), nullable=True)
+
+
+# ── Calendar routes ───────────────────────────────────────────────────────────
+# Paste these alongside your /login and /signup routes
+
+@app.route("/calendar/events", methods=["GET"])
+def get_calendar_events():
+    user_id = request.args.get("user_id", "")
+    year    = request.args.get("year",  type=int)
+    month   = request.args.get("month", type=int)
+
+    query = CalendarEvent.query.filter_by(user_id=user_id)
+    if year and month:
+        prefix = f"{year:04d}-{month:02d}"
+        query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
+
+    events = query.order_by(CalendarEvent.event_date, CalendarEvent.event_time).all()
+    return jsonify({"events": [{
+        "id":            e.id,
+        "title":         e.title,
+        "event_date":    e.event_date,
+        "event_type":    e.event_type,
+        "event_time":    e.event_time,
+        "notify_before": e.notify_before,
+        "note":          e.note,
+    } for e in events]})
+
+
+@app.route("/calendar/events", methods=["POST"])
+def add_calendar_event():
+    data = request.get_json() or {}
+    ev = CalendarEvent(
+        user_id       = str(data.get("user_id", "")),
+        title         = data.get("title", ""),
+        event_date    = data.get("event_date", ""),
+        event_type    = data.get("event_type", "Other"),
+        event_time    = data.get("event_time", ""),
+        notify_before = data.get("notify_before", "None"),
+        note          = data.get("note", ""),
+    )
+    db.session.add(ev)
+    db.session.commit()
+    return jsonify({"success": True, "id": ev.id}), 201
+
+
+@app.route("/calendar/events/<int:event_id>", methods=["DELETE"])
+def delete_calendar_event(event_id):
+    ev = CalendarEvent.query.get(event_id)
+    if ev:
+        db.session.delete(ev)
+        db.session.commit()
+    return jsonify({"success": True})
+
+
 # ── Plaid client setup ────────────────────────────────────────────────────────
 PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
 PLAID_SECRET    = os.getenv("PLAID_SECRET")
