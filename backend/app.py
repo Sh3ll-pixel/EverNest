@@ -35,8 +35,7 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     plaid_access_token = db.Column(db.String(255), nullable=True)
 
-with app.app_context():
-    db.create_all()
+
 # ==============================================================================
 # Budget Model
 # ==============================================================================
@@ -153,6 +152,9 @@ def delete_calendar_event(event_id):
         db.session.delete(ev)
         db.session.commit()
     return jsonify({"success": True})
+
+with app.app_context():
+    db.create_all()
 
 
 # ── Plaid client setup ────────────────────────────────────────────────────────
