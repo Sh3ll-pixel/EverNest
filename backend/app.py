@@ -5,6 +5,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_cors import CORS
 import plaid
+import json
 from plaid.api import plaid_api
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
@@ -36,6 +37,56 @@ class User(db.Model):
 
 with app.app_context():
     db.create_all()
+# ==============================================================================
+# Budget Model
+# ==============================================================================
+class Budget(db.Model):
+    id          = db.Column(db.Integer, primary_key=True)
+    user_id     = db.Column(db.String(80), unique=True, nullable=False)
+    income      = db.Column(db.Float, default=0)
+    payday_freq = db.Column(db.String(30), default="Bi-Weekly")
+    next_payday = db.Column(db.String(10), nullable=True)
+    categories  = db.Column(db.Text, default="{}")   # JSON string
+    bills       = db.Column(db.Text, default="[]")   # JSON string
+
+
+# ── Budget routes ─────────────────────────────────────────────────────────────
+# Paste alongside /login, /signup, /calendar routes
+
+@app.route("/budget", methods=["GET"])
+def get_budget():
+    user_id = request.args.get("user_id", "")
+    budget  = Budget.query.filter_by(user_id=user_id).first()
+    if not budget:
+        return jsonify({"budget": None})
+    return jsonify({"budget": {
+        "income":      budget.income,
+        "payday_freq": budget.payday_freq,
+        "next_payday": budget.next_payday,
+        "categories":  json.loads(budget.categories or "{}"),
+        "bills":       json.loads(budget.bills or "[]"),
+    }})
+
+
+@app.route("/budget", methods=["POST"])
+def save_budget_route():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+
+    budget = Budget.query.filter_by(user_id=user_id).first()
+    if not budget:
+        budget = Budget(user_id=user_id)
+        db.session.add(budget)
+
+    budget.income      = float(data.get("income", 0))
+    budget.payday_freq = data.get("payday_freq", "Bi-Weekly")
+    budget.next_payday = data.get("next_payday", "")
+    budget.categories  = json.dumps(data.get("categories", {}))
+    budget.bills       = json.dumps(data.get("bills", []))
+
+    db.session.commit()
+    return jsonify({"success": True}), 201
+
 
 # ── Calendar Integration ──────────────────────────────────────────────────────
 # ── Calendar model ────────────────────────────────────────────────────────────
