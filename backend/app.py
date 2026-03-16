@@ -48,6 +48,81 @@ class Budget(db.Model):
     categories  = db.Column(db.Text, default="{}")   # JSON string
     bills       = db.Column(db.Text, default="[]")   # JSON string
 
+# ==============================================================================
+# Note Model
+# ==============================================================================
+class Note(db.Model):
+    id               = db.Column(db.Integer, primary_key=True)
+    user_id          = db.Column(db.String(80), nullable=False)
+    title            = db.Column(db.String(200), default="Untitled")
+    body             = db.Column(db.Text, default="")
+    note_type        = db.Column(db.String(20), default="note")   # "note" or "checklist"
+    checklist_items  = db.Column(db.Text, default="[]")            # JSON string
+    updated_at       = db.Column(db.DateTime, default=datetime.datetime.utcnow,
+                                  onupdate=datetime.datetime.utcnow)
+    
+# ==============================================================================
+# Note Routes
+# ==============================================================================
+@app.route("/notes", methods=["GET"])
+def get_notes():
+    user_id = request.args.get("user_id", "")
+    notes   = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
+    return jsonify({"notes": [{
+        "id":               n.id,
+        "title":            n.title,
+        "body":             n.body,
+        "note_type":        n.note_type,
+        "checklist_items":  json.loads(n.checklist_items or "[]"),
+        "updated_at":       n.updated_at.isoformat() if n.updated_at else "",
+    } for n in notes]})
+ 
+ 
+@app.route("/notes", methods=["POST"])
+def create_note():
+    data = request.get_json() or {}
+    note = Note(
+        user_id         = str(data.get("user_id", "")),
+        title           = data.get("title", "Untitled"),
+        body            = data.get("body", ""),
+        note_type       = data.get("note_type", "note"),
+        checklist_items = json.dumps(data.get("checklist_items", [])),
+        updated_at      = datetime.datetime.utcnow(),
+    )
+    db.session.add(note)
+    db.session.commit()
+    return jsonify({"success": True, "note": {
+        "id":              note.id,
+        "title":           note.title,
+        "body":            note.body,
+        "note_type":       note.note_type,
+        "checklist_items": json.loads(note.checklist_items),
+        "updated_at":      note.updated_at.isoformat(),
+    }}), 201
+ 
+ 
+@app.route("/notes/<int:note_id>", methods=["PUT"])
+def update_note(note_id):
+    note = Note.query.get(note_id)
+    if not note:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json() or {}
+    note.title           = data.get("title", note.title)
+    note.body            = data.get("body", note.body)
+    note.note_type       = data.get("note_type", note.note_type)
+    note.checklist_items = json.dumps(data.get("checklist_items", []))
+    note.updated_at      = datetime.datetime.utcnow()
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/notes/<int:note_id>", methods=["DELETE"])
+def delete_note_route(note_id):
+    note = Note.query.get(note_id)
+    if note:
+        db.session.delete(note)
+        db.session.commit()
+    return jsonify({"success": True})
 
 # ── Budget routes ─────────────────────────────────────────────────────────────
 # Paste alongside /login, /signup, /calendar routes
