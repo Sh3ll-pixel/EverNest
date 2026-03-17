@@ -16,7 +16,7 @@ from plaid.model.transactions_get_request_options import TransactionsGetRequestO
 from plaid.model.country_code import CountryCode
 from plaid.model.products import Products
 import stripe
-from apscheduler.schedulers.background import BackgroundScheduler
+import BackgroundScheduler
 
 app = Flask(__name__)
 CORS(app)
@@ -306,27 +306,20 @@ def paypal_success():
  
  
 # ── Daily job: expire lapsed subscriptions ────────────────────────────────────
-def expire_lapsed_subscriptions():
-    with app.app_context():
-        now      = datetime.datetime.utcnow()
-        expired  = User.query.filter(
-            User.is_subscribed == True,
-            User.subscription_end != None,
-            User.subscription_end < now
-        ).all()
-        for user in expired:
-            user.is_subscribed = False
-        if expired:
-            db.session.commit()
+#def expire_lapsed_subscriptions():
+#    with app.app_context():
+#        now      = datetime.datetime.utcnow()
+#        expired  = User.query.filter(
+#            User.is_subscribed == True,
+#            User.subscription_end != None,
+#            User.subscription_end < now
+#        ).all()
+#        for user in expired:
+#            user.is_subscribed = False
+#        if expired:
+#            db.session.commit()
  
 # Start scheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-import atexit
-
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(expire_lapsed_subscriptions, "interval", hours=12)
-scheduler.start()
-atexit.register(lambda: scheduler.shutdown(wait=False))     
 
 
 # ==============================================================================
