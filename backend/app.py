@@ -38,6 +38,10 @@ class User(db.Model):
     email         = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     plaid_access_token = db.Column(db.String(255), nullable=True)
+    is_subscribed          = db.Column(db.Boolean, default=False)
+    subscription_end       = db.Column(db.DateTime, nullable=True)
+    stripe_customer_id     = db.Column(db.String(100), nullable=True)
+    paypal_subscription_id = db.Column(db.String(100), nullable=True)
 
 #===============================================================================
 # Stripe and Paypal
