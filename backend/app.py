@@ -835,6 +835,125 @@ def login():
     }
 }), 200
 
+# ==============================================================================
+# Settings Routes
+# ==============================================================================
+# =============================================================================
+#  SETTINGS ROUTES — paste into app.py alongside other routes
+# =============================================================================
+ 
+@app.route("/settings/update_profile", methods=["POST"])
+def update_profile():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"success": False, "message": "User not found"}), 404
+ 
+    if "username" in data:
+        existing = User.query.filter_by(username=data["username"]).first()
+        if existing and existing.id != user.id:
+            return jsonify({"success": False, "message": "Username already taken"}), 409
+        user.username = data["username"]
+ 
+    if "email" in data:
+        existing = User.query.filter_by(email=data["email"]).first()
+        if existing and existing.id != user.id:
+            return jsonify({"success": False, "message": "Email already in use"}), 409
+        user.email = data["email"]
+ 
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/settings/change_password", methods=["POST"])
+def change_password():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"success": False, "message": "User not found"}), 404
+ 
+    if not bcrypt.check_password_hash(user.password_hash, data.get("current_password", "")):
+        return jsonify({"success": False, "message": "Current password is incorrect"}), 401
+ 
+    user.password_hash = bcrypt.generate_password_hash(
+        data.get("new_password", "")
+    ).decode("utf-8")
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/settings/remove_bank", methods=["POST"])
+def remove_bank():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"success": False}), 404
+    user.plaid_access_token = None
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/settings/report_bug", methods=["POST"])
+def report_bug():
+    data = request.get_json() or {}
+    # Log it to Render logs for now — can wire to email later
+    print(f"BUG REPORT from user {data.get('user_id')}: {data.get('description')}")
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/settings/delete_account", methods=["DELETE"])
+def delete_account():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"success": False}), 404
+ 
+    # Delete all related data
+    CalendarEvent.query.filter_by(user_id=str(user.id)).delete()
+    CalendarEvent.query.filter_by(user_id=user.username).delete()
+    Note.query.filter_by(user_id=str(user.id)).delete()
+    Budget.query.filter_by(user_id=str(user.id)).delete()
+    FamilyMember.query.filter_by(user_id=user.id).delete()
+ 
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/subscription/cancel", methods=["POST"])
+def cancel_subscription():
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"success": False}), 404
+ 
+    # Cancel on Stripe if applicable
+    if user.stripe_customer_id:
+        try:
+            subscriptions = stripe.Subscription.list(customer=user.stripe_customer_id)
+            for sub in subscriptions.auto_paging_iter():
+                stripe.Subscription.modify(sub.id, cancel_at_period_end=True)
+        except Exception:
+            pass
+ 
+    # Don't immediately revoke — let it expire at period end
+    return jsonify({"success": True})
+
 # ── Plaid routes ──────────────────────────────────────────────────────────────
 @app.route("/plaid/create_link_token", methods=["POST"])
 def create_link_token():
