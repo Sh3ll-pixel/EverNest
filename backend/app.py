@@ -67,29 +67,7 @@ def get_paypal_access_token():
     )
     return resp.json().get("access_token")
  
- 
-# ── Migration route (run once, then delete) ───────────────────────────────────
-@app.route("/migrate_subscription")
-def migrate_subscription():
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(db.text(
-                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN DEFAULT FALSE"
-            ))
-            conn.execute(db.text(
-                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS subscription_end TIMESTAMP"
-            ))
-            conn.execute(db.text(
-                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(100)"
-            ))
-            conn.execute(db.text(
-                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS paypal_subscription_id VARCHAR(100)"
-            ))
-            conn.commit()
-        return "Subscription migration successful", 200
-    except Exception as e:
-        return str(e), 400
- 
+
  
 # ── Check subscription status ─────────────────────────────────────────────────
 @app.route("/subscription/status", methods=["GET"])
