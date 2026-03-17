@@ -16,7 +16,6 @@ from plaid.model.transactions_get_request_options import TransactionsGetRequestO
 from plaid.model.country_code import CountryCode
 from plaid.model.products import Products
 import stripe
-import BackgroundScheduler
 
 app = Flask(__name__)
 CORS(app)
