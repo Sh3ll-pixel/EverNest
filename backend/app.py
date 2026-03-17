@@ -114,9 +114,9 @@ def stripe_create_session():
             customer_id = user.stripe_customer_id
         else:
             customer = stripe.Customer.create(
-                email=user.email,
-                metadata={"user_id": str(user.id)}
-            )
+            email=user.email if "@" in (user.email or "") else None,
+            metadata={"user_id": str(user.id)}
+        )
             user.stripe_customer_id = customer.id
             db.session.commit()
             customer_id = customer.id
