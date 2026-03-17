@@ -6,4 +6,3 @@ gunicorn
 psycopg2-binary
 plaid-python
 stripe
-apscheduler
