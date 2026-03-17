@@ -838,17 +838,7 @@ def login():
 # ==============================================================================
 # Temp Routes
 # ==============================================================================
-@app.route("/fix_stripe_customer")
-def fix_stripe_customer():
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(db.text(
-                "UPDATE \"user\" SET stripe_customer_id = NULL"
-            ))
-            conn.commit()
-        return "Fixed", 200
-    except Exception as e:
-        return str(e), 400
+
 
 # =============================================================================
 #  SETTINGS ROUTES
