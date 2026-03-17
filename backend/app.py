@@ -15,6 +15,8 @@ from plaid.model.transactions_get_request import TransactionsGetRequest
 from plaid.model.transactions_get_request_options import TransactionsGetRequestOptions
 from plaid.model.country_code import CountryCode
 from plaid.model.products import Products
+import stripe
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 CORS(app)
@@ -34,6 +36,310 @@ class User(db.Model):
     email         = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     plaid_access_token = db.Column(db.String(255), nullable=True)
+
+#===============================================================================
+# Stripe and Paypal
+# ==============================================================================
+# ── Stripe setup ──────────────────────────────────────────────────────────────
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID       = os.getenv("STRIPE_PRICE_ID")
+ 
+# ── PayPal setup ──────────────────────────────────────────────────────────────
+PAYPAL_CLIENT_ID     = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
+PAYPAL_PLAN_ID       = os.getenv("PAYPAL_PLAN_ID")
+PAYPAL_API_BASE      = "https://api-m.sandbox.paypal.com"  # change to api-m.paypal.com for live
+ 
+def get_paypal_access_token():
+    import base64
+    credentials = base64.b64encode(
+        f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}".encode()
+    ).decode()
+    resp = requests.post(
+        f"{PAYPAL_API_BASE}/v1/oauth2/token",
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type":  "application/x-www-form-urlencoded",
+        },
+        data="grant_type=client_credentials",
+        timeout=10
+    )
+    return resp.json().get("access_token")
+ 
+ 
+# ── Migration route (run once, then delete) ───────────────────────────────────
+@app.route("/migrate_subscription")
+def migrate_subscription():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN DEFAULT FALSE"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS subscription_end TIMESTAMP"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(100)"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS paypal_subscription_id VARCHAR(100)"
+            ))
+            conn.commit()
+        return "Subscription migration successful", 200
+    except Exception as e:
+        return str(e), 400
+ 
+ 
+# ── Check subscription status ─────────────────────────────────────────────────
+@app.route("/subscription/status", methods=["GET"])
+def subscription_status():
+    user_id = request.args.get("user_id")
+    user = User.query.filter(
+        (User.id == user_id) | (User.username == user_id)
+    ).first()
+    if not user:
+        return jsonify({"subscribed": False}), 404
+ 
+    # Check if subscription_end has passed
+    if user.is_subscribed and user.subscription_end:
+        if datetime.datetime.utcnow() > user.subscription_end:
+            user.is_subscribed = False
+            db.session.commit()
+ 
+    return jsonify({
+        "subscribed":        user.is_subscribed or False,
+        "subscription_end":  user.subscription_end.isoformat() if user.subscription_end else None,
+    })
+ 
+ 
+# ── Stripe: create checkout session ──────────────────────────────────────────
+@app.route("/subscription/stripe/create-session", methods=["POST"])
+def stripe_create_session():
+    try:
+        data    = request.get_json() or {}
+        user_id = str(data.get("user_id", ""))
+        user    = User.query.filter(
+            (User.id == user_id) | (User.username == user_id)
+        ).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+ 
+        # Create or reuse Stripe customer
+        if user.stripe_customer_id:
+            customer_id = user.stripe_customer_id
+        else:
+            customer = stripe.Customer.create(
+                email=user.email,
+                metadata={"user_id": str(user.id)}
+            )
+            user.stripe_customer_id = customer.id
+            db.session.commit()
+            customer_id = customer.id
+ 
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            mode="subscription",
+            success_url="https://evernest-swz9.onrender.com/subscription/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://evernest-swz9.onrender.com/subscription/cancel",
+            metadata={"user_id": str(user.id)},
+        )
+        return jsonify({"url": session.url})
+ 
+    except stripe.error.StripeError as e:
+        return jsonify({"error": str(e)}), 400
+ 
+ 
+# ── Stripe: webhook ───────────────────────────────────────────────────────────
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    payload   = request.get_data(as_text=True)
+    sig_header = request.headers.get("Stripe-Signature")
+ 
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except (ValueError, stripe.error.SignatureVerificationError):
+        return "", 400
+ 
+    if event["type"] == "invoice.paid":
+        invoice     = event["data"]["object"]
+        customer_id = invoice.get("customer")
+        period_end  = invoice.get("lines", {}).get("data", [{}])[0].get(
+            "period", {}).get("end")
+ 
+        user = User.query.filter_by(stripe_customer_id=customer_id).first()
+        if user:
+            user.is_subscribed    = True
+            user.subscription_end = (
+                datetime.datetime.utcfromtimestamp(period_end)
+                if period_end else
+                datetime.datetime.utcnow() + datetime.timedelta(days=31)
+            )
+            db.session.commit()
+ 
+    elif event["type"] in ("invoice.payment_failed", "customer.subscription.deleted"):
+        customer_id = event["data"]["object"].get("customer")
+        user = User.query.filter_by(stripe_customer_id=customer_id).first()
+        if user:
+            user.is_subscribed = False
+            db.session.commit()
+ 
+    return "", 200
+ 
+ 
+# ── Stripe: success / cancel redirect pages ───────────────────────────────────
+@app.route("/subscription/success")
+def subscription_success():
+    return """
+    <html><body style="background:#23272D;color:#96abff;font-family:Arial;
+    display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
+    <div>
+      <div style="font-size:48px;margin-bottom:16px;">✓</div>
+      <h2 style="color:#4CFF7A;font-size:24px;margin-bottom:8px;">Subscription Active!</h2>
+      <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
+      Close this tab and reopen the app to get started.</p>
+    </div></body></html>
+    """, 200, {"Content-Type": "text/html"}
+ 
+ 
+@app.route("/subscription/cancel")
+def subscription_cancel():
+    return """
+    <html><body style="background:#23272D;color:#96abff;font-family:Arial;
+    display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
+    <div>
+      <div style="font-size:48px;margin-bottom:16px;">✕</div>
+      <h2 style="color:#FF6B6B;font-size:24px;margin-bottom:8px;">Checkout Cancelled</h2>
+      <p style="color:#9A9A9A;">No charges were made.<br>
+      Close this tab and try again from EverNest.</p>
+    </div></body></html>
+    """, 200, {"Content-Type": "text/html"}
+ 
+ 
+# ── PayPal: create subscription ───────────────────────────────────────────────
+@app.route("/subscription/paypal/create", methods=["POST"])
+def paypal_create_subscription():
+    try:
+        data    = request.get_json() or {}
+        user_id = str(data.get("user_id", ""))
+        user    = User.query.filter(
+            (User.id == user_id) | (User.username == user_id)
+        ).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+ 
+        token = get_paypal_access_token()
+        resp  = requests.post(
+            f"{PAYPAL_API_BASE}/v1/billing/subscriptions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "plan_id": PAYPAL_PLAN_ID,
+                "subscriber": {"email_address": user.email},
+                "application_context": {
+                    "return_url": "https://evernest-swz9.onrender.com/subscription/paypal/success",
+                    "cancel_url": "https://evernest-swz9.onrender.com/subscription/cancel",
+                    "user_action": "SUBSCRIBE_NOW",
+                },
+            },
+            timeout=15
+        )
+        pp_data = resp.json()
+        approve_url = next(
+            (l["href"] for l in pp_data.get("links", []) if l["rel"] == "approve"),
+            None
+        )
+        sub_id = pp_data.get("id")
+ 
+        # Store PayPal sub ID on user
+        if sub_id:
+            user.paypal_subscription_id = sub_id
+            db.session.commit()
+ 
+        if approve_url:
+            return jsonify({"url": approve_url})
+        return jsonify({"error": "Could not get PayPal approval URL"}), 400
+ 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+ 
+ 
+# ── PayPal: webhook ───────────────────────────────────────────────────────────
+@app.route("/paypal/webhook", methods=["POST"])
+def paypal_webhook():
+    try:
+        event     = request.get_json() or {}
+        event_type = event.get("event_type", "")
+        resource   = event.get("resource", {})
+        sub_id     = resource.get("id")
+ 
+        user = User.query.filter_by(paypal_subscription_id=sub_id).first()
+        if not user:
+            return "", 200
+ 
+        if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+            user.is_subscribed    = True
+            user.subscription_end = datetime.datetime.utcnow() + datetime.timedelta(days=31)
+            db.session.commit()
+ 
+        elif event_type in (
+            "BILLING.SUBSCRIPTION.CANCELLED",
+            "BILLING.SUBSCRIPTION.SUSPENDED",
+            "BILLING.SUBSCRIPTION.EXPIRED",
+        ):
+            user.is_subscribed = False
+            db.session.commit()
+ 
+        elif event_type == "PAYMENT.SALE.COMPLETED":
+            # Renew for another month
+            user.is_subscribed    = True
+            user.subscription_end = datetime.datetime.utcnow() + datetime.timedelta(days=31)
+            db.session.commit()
+ 
+        return "", 200
+    except Exception:
+        return "", 200
+ 
+ 
+@app.route("/subscription/paypal/success")
+def paypal_success():
+    return """
+    <html><body style="background:#23272D;color:#96abff;font-family:Arial;
+    display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
+    <div>
+      <div style="font-size:48px;margin-bottom:16px;">✓</div>
+      <h2 style="color:#4CFF7A;font-size:24px;margin-bottom:8px;">PayPal Subscription Active!</h2>
+      <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
+      Close this tab and reopen the app to get started.</p>
+    </div></body></html>
+    """, 200, {"Content-Type": "text/html"}
+ 
+ 
+# ── Daily job: expire lapsed subscriptions ────────────────────────────────────
+def expire_lapsed_subscriptions():
+    with app.app_context():
+        now      = datetime.datetime.utcnow()
+        expired  = User.query.filter(
+            User.is_subscribed == True,
+            User.subscription_end != None,
+            User.subscription_end < now
+        ).all()
+        for user in expired:
+            user.is_subscribed = False
+        if expired:
+            db.session.commit()
+ 
+# Start scheduler
+from apscheduler.schedulers.background import BackgroundScheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(expire_lapsed_subscriptions, "interval", hours=12)
+scheduler.start()     
 
 
 # ==============================================================================
