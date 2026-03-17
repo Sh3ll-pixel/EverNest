@@ -321,9 +321,12 @@ def expire_lapsed_subscriptions():
  
 # Start scheduler
 from apscheduler.schedulers.background import BackgroundScheduler
-scheduler = BackgroundScheduler()
+import atexit
+
+scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(expire_lapsed_subscriptions, "interval", hours=12)
-scheduler.start()     
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown(wait=False))     
 
 
 # ==============================================================================
