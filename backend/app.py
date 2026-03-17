@@ -75,30 +75,6 @@ class FamilyInvite(db.Model):
 # ==============================================================================
 # Family Routes
 # ==============================================================================
-# ── Migration route (run once, then delete) ───────────────────────────────────
- 
-@app.route("/migrate_family")
-def migrate_family():
-    try:
-        with db.engine.connect() as conn:
-            # Add family_id to CalendarEvent if not exists
-            conn.execute(db.text(
-                'ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS family_id INTEGER'
-            ))
-            # Add created_by_id to CalendarEvent if not exists
-            conn.execute(db.text(
-                'ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS created_by_id INTEGER'
-            ))
-            # Add family_id to budget if not exists
-            conn.execute(db.text(
-                'ALTER TABLE budget ADD COLUMN IF NOT EXISTS family_id INTEGER'
-            ))
-            conn.commit()
-        return "Family migration successful", 200
-    except Exception as e:
-        return str(e), 400
- 
- 
 # ── Helper: get user's family ─────────────────────────────────────────────────
  
 def get_user_family(user_id):
