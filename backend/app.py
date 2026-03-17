@@ -21,6 +21,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 CORS(app)
 
+
+
 # ── App config ────────────────────────────────────────────────────────────────
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///users.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -996,6 +998,27 @@ def plaid_link_page():
     </html>
     """
     return html, 200, {"Content-Type": "text/html"}
+
+@app.route("/migrate_subscription")
+def migrate_subscription():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS is_subscribed BOOLEAN DEFAULT FALSE"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS subscription_end TIMESTAMP"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(100)"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS paypal_subscription_id VARCHAR(100)"
+            ))
+            conn.commit()
+        return "Subscription migration successful", 200
+    except Exception as e:
+        return str(e), 400
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
