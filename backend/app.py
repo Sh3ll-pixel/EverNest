@@ -48,6 +48,233 @@ class Budget(db.Model):
     categories  = db.Column(db.Text, default="{}")   # JSON string
     bills       = db.Column(db.Text, default="[]")   # JSON string
 
+# =============================================================================
+# Family Models
+# =============================================================================
+class Family(db.Model):
+    id         = db.Column(db.Integer, primary_key=True)
+    name       = db.Column(db.String(100), default="My Family")
+    created_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+ 
+ 
+class FamilyMember(db.Model):
+    id        = db.Column(db.Integer, primary_key=True)
+    family_id = db.Column(db.Integer, db.ForeignKey("family.id"), nullable=False)
+    user_id   = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    color     = db.Column(db.String(10), default="#96abff")   # calendar color
+ 
+ 
+class FamilyInvite(db.Model):
+    id             = db.Column(db.Integer, primary_key=True)
+    family_id      = db.Column(db.Integer, db.ForeignKey("family.id"), nullable=False)
+    invited_email  = db.Column(db.String(120), nullable=False)
+    invited_by     = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    status         = db.Column(db.String(20), default="pending")  # pending/accepted/declined
+    created_at     = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+# ==============================================================================
+# Family Routes
+# ==============================================================================
+# ── Migration route (run once, then delete) ───────────────────────────────────
+ 
+@app.route("/migrate_family")
+def migrate_family():
+    try:
+        with db.engine.connect() as conn:
+            # Add family_id to CalendarEvent if not exists
+            conn.execute(db.text(
+                'ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS family_id INTEGER'
+            ))
+            # Add created_by_id to CalendarEvent if not exists
+            conn.execute(db.text(
+                'ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS created_by_id INTEGER'
+            ))
+            # Add family_id to budget if not exists
+            conn.execute(db.text(
+                'ALTER TABLE budget ADD COLUMN IF NOT EXISTS family_id INTEGER'
+            ))
+            conn.commit()
+        return "Family migration successful", 200
+    except Exception as e:
+        return str(e), 400
+ 
+ 
+# ── Helper: get user's family ─────────────────────────────────────────────────
+ 
+def get_user_family(user_id):
+    """Returns (family, member) or (None, None)"""
+    member = FamilyMember.query.filter_by(user_id=user_id).first()
+    if not member:
+        return None, None
+    family = Family.query.get(member.family_id)
+    return family, member
+ 
+ 
+def get_family_member_ids(family_id):
+    """Returns list of user_ids in a family"""
+    members = FamilyMember.query.filter_by(family_id=family_id).all()
+    return [m.user_id for m in members]
+ 
+ 
+# ── Family routes ─────────────────────────────────────────────────────────────
+ 
+@app.route("/family/create", methods=["POST"])
+def create_family():
+    data    = request.get_json() or {}
+    user_id = int(data.get("user_id", 0))
+    name    = data.get("name", "My Family")
+ 
+    # Check if user already in a family
+    existing = FamilyMember.query.filter_by(user_id=user_id).first()
+    if existing:
+        return jsonify({"success": False, "message": "You are already in a family."}), 400
+ 
+    family = Family(name=name, created_by=user_id)
+    db.session.add(family)
+    db.session.flush()
+ 
+    member = FamilyMember(family_id=family.id, user_id=user_id, color="#96abff")
+    db.session.add(member)
+    db.session.commit()
+ 
+    return jsonify({"success": True, "family_id": family.id, "name": family.name}), 201
+ 
+ 
+@app.route("/family/info", methods=["GET"])
+def get_family_info():
+    user_id = int(request.args.get("user_id", 0))
+    family, member = get_user_family(user_id)
+ 
+    if not family:
+        # Check for pending invites
+        user = User.query.get(user_id)
+        pending = []
+        if user:
+            invites = FamilyInvite.query.filter_by(
+                invited_email=user.email, status="pending"
+            ).all()
+            for inv in invites:
+                fam = Family.query.get(inv.family_id)
+                inviter = User.query.get(inv.invited_by)
+                pending.append({
+                    "invite_id":    inv.id,
+                    "family_id":    inv.family_id,
+                    "family_name":  fam.name if fam else "Unknown",
+                    "invited_by":   inviter.username if inviter else "Unknown",
+                })
+        return jsonify({"family": None, "pending_invites": pending})
+ 
+    # Get all members
+    members_data = []
+    member_ids   = get_family_member_ids(family.id)
+    colors       = ["#96abff", "#4CFF7A", "#FF6B6B", "#FFD700", "#FF9F40", "#C084FC"]
+    for i, uid in enumerate(member_ids):
+        u = User.query.get(uid)
+        if u:
+            fm = FamilyMember.query.filter_by(family_id=family.id, user_id=uid).first()
+            members_data.append({
+                "user_id":  uid,
+                "username": u.username,
+                "email":    u.email,
+                "color":    fm.color if fm else colors[i % len(colors)],
+                "is_me":    uid == user_id,
+            })
+ 
+    # Pending outgoing invites
+    pending_out = []
+    outgoing = FamilyInvite.query.filter_by(family_id=family.id, status="pending").all()
+    for inv in outgoing:
+        pending_out.append({"invite_id": inv.id, "email": inv.invited_email})
+ 
+    return jsonify({
+        "family": {
+            "id":      family.id,
+            "name":    family.name,
+            "members": members_data,
+            "my_color": member.color,
+        },
+        "pending_invites":  [],
+        "pending_outgoing": pending_out,
+    })
+ 
+ 
+@app.route("/family/invite", methods=["POST"])
+def invite_to_family():
+    data          = request.get_json() or {}
+    user_id       = int(data.get("user_id", 0))
+    invited_email = data.get("email", "").strip().lower()
+ 
+    family, member = get_user_family(user_id)
+    if not family:
+        return jsonify({"success": False, "message": "You are not in a family yet."}), 400
+ 
+    # Check if email already in family
+    invited_user = User.query.filter_by(email=invited_email).first()
+    if invited_user:
+        already = FamilyMember.query.filter_by(
+            family_id=family.id, user_id=invited_user.id
+        ).first()
+        if already:
+            return jsonify({"success": False, "message": "That user is already in your family."}), 400
+ 
+    # Check for existing pending invite
+    existing_inv = FamilyInvite.query.filter_by(
+        family_id=family.id, invited_email=invited_email, status="pending"
+    ).first()
+    if existing_inv:
+        return jsonify({"success": False, "message": "Invite already sent."}), 400
+ 
+    invite = FamilyInvite(
+        family_id=family.id,
+        invited_email=invited_email,
+        invited_by=user_id,
+    )
+    db.session.add(invite)
+    db.session.commit()
+    return jsonify({"success": True, "message": f"Invite sent to {invited_email}."})
+ 
+ 
+@app.route("/family/invite/respond", methods=["POST"])
+def respond_to_invite():
+    data      = request.get_json() or {}
+    user_id   = int(data.get("user_id", 0))
+    invite_id = int(data.get("invite_id", 0))
+    accept    = data.get("accept", False)
+ 
+    invite = FamilyInvite.query.get(invite_id)
+    if not invite or invite.status != "pending":
+        return jsonify({"success": False, "message": "Invite not found."}), 404
+ 
+    if accept:
+        invite.status = "accepted"
+        # Check not already in a family
+        existing = FamilyMember.query.filter_by(user_id=user_id).first()
+        if not existing:
+            colors = ["#96abff", "#4CFF7A", "#FF6B6B", "#FFD700", "#FF9F40", "#C084FC"]
+            count  = FamilyMember.query.filter_by(family_id=invite.family_id).count()
+            member = FamilyMember(
+                family_id=invite.family_id,
+                user_id=user_id,
+                color=colors[count % len(colors)]
+            )
+            db.session.add(member)
+    else:
+        invite.status = "declined"
+ 
+    db.session.commit()
+    return jsonify({"success": True})
+ 
+ 
+@app.route("/family/leave", methods=["POST"])
+def leave_family():
+    data    = request.get_json() or {}
+    user_id = int(data.get("user_id", 0))
+    member  = FamilyMember.query.filter_by(user_id=user_id).first()
+    if member:
+        db.session.delete(member)
+        db.session.commit()
+    return jsonify({"success": True})
+
 # ==============================================================================
 # Note Model
 # ==============================================================================
@@ -185,13 +412,45 @@ def get_calendar_events():
     user_id = request.args.get("user_id", "")
     year    = request.args.get("year",  type=int)
     month   = request.args.get("month", type=int)
-
-    query = CalendarEvent.query.filter_by(user_id=user_id)
-    if year and month:
-        prefix = f"{year:04d}-{month:02d}"
-        query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
-
-    events = query.order_by(CalendarEvent.event_date, CalendarEvent.event_time).all()
+ 
+    # Get all user_ids to fetch events for (self + family members)
+    try:
+        uid_int = int(user_id)
+        family, member = get_user_family(uid_int)
+        if family:
+            member_ids = get_family_member_ids(family.id)
+        else:
+            member_ids = [uid_int]
+    except (ValueError, TypeError):
+        member_ids = []
+ 
+    # Build color map
+    color_map = {}
+    if family:
+        for fm in FamilyMember.query.filter_by(family_id=family.id).all():
+            color_map[fm.user_id] = fm.color
+ 
+    # Query events for all members
+    all_events = []
+    for uid in member_ids:
+        query = CalendarEvent.query.filter_by(user_id=str(uid))
+        if year and month:
+            prefix = f"{year:04d}-{month:02d}"
+            query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
+        all_events.extend(query.order_by(
+            CalendarEvent.event_date, CalendarEvent.event_time
+        ).all())
+ 
+    # Also fetch by string user_id for backwards compat
+    if not member_ids:
+        query = CalendarEvent.query.filter_by(user_id=str(user_id))
+        if year and month:
+            prefix = f"{year:04d}-{month:02d}"
+            query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
+        all_events = query.order_by(
+            CalendarEvent.event_date, CalendarEvent.event_time
+        ).all()
+ 
     return jsonify({"events": [{
         "id":            e.id,
         "title":         e.title,
@@ -200,7 +459,9 @@ def get_calendar_events():
         "event_time":    e.event_time,
         "notify_before": e.notify_before,
         "note":          e.note,
-    } for e in events]})
+        "created_by":    e.user_id,
+        "color":         color_map.get(int(e.user_id), "#96abff") if e.user_id.isdigit() else "#96abff",
+    } for e in all_events]})
 
 
 @app.route("/calendar/events", methods=["POST"])
@@ -295,15 +556,18 @@ def login():
     if not user or not bcrypt.check_password_hash(user.password_hash, password):
         return jsonify({"success": False, "message": "Invalid credentials"}), 401
 
+    family, member = get_user_family(user.id)
+
     return jsonify({
-        "success": True,
-        "message": "Login successful",
-        "user": {
-            "id":       user.id,
-            "username": user.username,
-            "email":    user.email
-        }
-    }), 200
+    "success": True,
+    "message": "Login successful",
+    "user": {
+        "id":        user.id,
+        "username":  user.username,
+        "email":     user.email,
+        "family_id": family.id if family else None,
+    }
+}), 200
 
 # ── Plaid routes ──────────────────────────────────────────────────────────────
 @app.route("/plaid/create_link_token", methods=["POST"])
@@ -357,17 +621,39 @@ def exchange_token():
 def get_accounts():
     try:
         user_id = request.args.get("user_id")
-        user    = User.query.filter(
-            (User.id == user_id) | (User.username == user_id)
-        ).first()
-
-        if not user or not user.plaid_access_token:
-            return jsonify({"accounts": []})
-
-        response = plaid_client.accounts_get(AccountsGetRequest(access_token=user.plaid_access_token))
-        accounts = [a.to_dict() for a in response["accounts"]]
-        return jsonify({"accounts": accounts})
-    except plaid.ApiException as e:
+ 
+        # Collect all user_ids in family
+        try:
+            uid_int = int(user_id)
+            family, _ = get_user_family(uid_int)
+            if family:
+                member_ids = get_family_member_ids(family.id)
+            else:
+                member_ids = [uid_int]
+        except (ValueError, TypeError):
+            user = User.query.filter(
+                (User.id == user_id) | (User.username == user_id)
+            ).first()
+            member_ids = [user.id] if user else []
+ 
+        all_accounts = []
+        for uid in member_ids:
+            u = User.query.get(uid)
+            if u and u.plaid_access_token:
+                try:
+                    resp     = plaid_client.accounts_get(
+                        AccountsGetRequest(access_token=u.plaid_access_token)
+                    )
+                    accounts = [a.to_dict() for a in resp["accounts"]]
+                    # Tag each account with owner username
+                    for acct in accounts:
+                        acct["owner"] = u.username
+                    all_accounts.extend(accounts)
+                except Exception:
+                    pass
+ 
+        return jsonify({"accounts": all_accounts})
+    except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
