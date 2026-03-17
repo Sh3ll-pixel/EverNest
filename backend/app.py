@@ -172,7 +172,8 @@ def stripe_webhook():
             db.session.commit()
  
     return "", 200
- 
+   
+   
  
 # ── Stripe: success / cancel redirect pages ───────────────────────────────────
 @app.route("/subscription/success")
