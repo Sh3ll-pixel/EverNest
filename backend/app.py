@@ -829,6 +829,9 @@ class CalendarEvent(db.Model):
     event_time    = db.Column(db.String(20), nullable=True)
     notify_before = db.Column(db.String(20), default="None")
     note          = db.Column(db.String(500), nullable=True)
+    color         = db.Column(db.String(10), nullable=True)    # custom hex color
+    recurrence    = db.Column(db.String(20), default="None")   # None/Daily/Weekly/Bi-Weekly/Monthly/Yearly
+    family_shared = db.Column(db.Boolean, default=True)        # visible to family members
 
 
 # ── Calendar routes ───────────────────────────────────────────────────────────
@@ -836,11 +839,15 @@ class CalendarEvent(db.Model):
 
 @app.route("/calendar/events", methods=["GET"])
 def get_calendar_events():
+    import calendar as cal_mod
+    from dateutil.relativedelta import relativedelta
+
     user_id = request.args.get("user_id", "")
     year    = request.args.get("year",  type=int)
     month   = request.args.get("month", type=int)
- 
+
     # Get all user_ids to fetch events for (self + family members)
+    family = None
     try:
         uid_int = int(user_id)
         family, member = get_user_family(uid_int)
@@ -850,45 +857,169 @@ def get_calendar_events():
             member_ids = [uid_int]
     except (ValueError, TypeError):
         member_ids = []
- 
+
     # Build color map
     color_map = {}
     if family:
         for fm in FamilyMember.query.filter_by(family_id=family.id).all():
             color_map[fm.user_id] = fm.color
- 
-    # Query events for all members
-    all_events = []
+
+    # Determine month date range
+    if year and month:
+        month_start = datetime.date(year, month, 1)
+        month_days  = cal_mod.monthrange(year, month)[1]
+        month_end   = datetime.date(year, month, month_days)
+    else:
+        month_start = None
+        month_end   = None
+
+    # Fetch events for all members
+    raw_events = []
     for uid in member_ids:
+        is_self = (str(uid) == str(user_id))
+        # One-time events for this month
         query = CalendarEvent.query.filter_by(user_id=str(uid))
-        if year and month:
+        if month_start:
             prefix = f"{year:04d}-{month:02d}"
-            query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
-        all_events.extend(query.order_by(
-            CalendarEvent.event_date, CalendarEvent.event_time
-        ).all())
- 
-    # Also fetch by string user_id for backwards compat
+            one_time = query.filter(
+                CalendarEvent.event_date.like(f"{prefix}%"),
+                CalendarEvent.recurrence.in_(["None", "", None])
+            ).all()
+        else:
+            one_time = query.filter(CalendarEvent.recurrence.in_(["None", "", None])).all()
+
+        # All recurring events (started on or before month_end)
+        recurring = query.filter(
+            CalendarEvent.recurrence.notin_(["None", "", None]) if db.session.bind else
+            ~CalendarEvent.recurrence.in_(["None", "", None])
+        ).all()
+
+        for ev in one_time:
+            if not is_self and not getattr(ev, 'family_shared', True):
+                continue
+            raw_events.append((ev, ev.event_date, is_self))
+
+        # Generate recurring instances within the month
+        for ev in recurring:
+            if not is_self and not getattr(ev, 'family_shared', True):
+                continue
+            try:
+                base_date = datetime.date.fromisoformat(ev.event_date)
+            except (ValueError, TypeError):
+                continue
+            if not month_start:
+                raw_events.append((ev, ev.event_date, is_self))
+                continue
+
+            dates = _generate_recurrence_dates(
+                base_date, ev.recurrence, month_start, month_end
+            )
+            for d in dates:
+                raw_events.append((ev, d.isoformat(), is_self))
+
+    # Fallback for string user_id with no family
     if not member_ids:
         query = CalendarEvent.query.filter_by(user_id=str(user_id))
-        if year and month:
+        if month_start:
             prefix = f"{year:04d}-{month:02d}"
-            query  = query.filter(CalendarEvent.event_date.like(f"{prefix}%"))
-        all_events = query.order_by(
-            CalendarEvent.event_date, CalendarEvent.event_time
-        ).all()
- 
-    return jsonify({"events": [{
-        "id":            e.id,
-        "title":         e.title,
-        "event_date":    e.event_date,
-        "event_type":    e.event_type,
-        "event_time":    e.event_time,
-        "notify_before": e.notify_before,
-        "note":          e.note,
-        "created_by":    e.user_id,
-        "color":         color_map.get(int(e.user_id), "#96abff") if e.user_id.isdigit() else "#96abff",
-    } for e in all_events]})
+            one_time = query.filter(
+                CalendarEvent.event_date.like(f"{prefix}%"),
+                CalendarEvent.recurrence.in_(["None", "", None])
+            ).all()
+            recurring = query.filter(
+                ~CalendarEvent.recurrence.in_(["None", "", None])
+            ).all()
+            for ev in one_time:
+                raw_events.append((ev, ev.event_date, True))
+            for ev in recurring:
+                try:
+                    base_date = datetime.date.fromisoformat(ev.event_date)
+                except (ValueError, TypeError):
+                    continue
+                dates = _generate_recurrence_dates(
+                    base_date, ev.recurrence, month_start, month_end
+                )
+                for d in dates:
+                    raw_events.append((ev, d.isoformat(), True))
+        else:
+            for ev in query.all():
+                raw_events.append((ev, ev.event_date, True))
+
+    # Build response
+    output = []
+    for ev, date_str, is_self in raw_events:
+        # Use custom color if set, otherwise fall back to member color or type default
+        ev_color = getattr(ev, 'color', '') or ''
+        if not ev_color and ev.user_id.isdigit():
+            ev_color = color_map.get(int(ev.user_id), "#96abff")
+        elif not ev_color:
+            ev_color = "#96abff"
+
+        output.append({
+            "id":            ev.id,
+            "title":         ev.title,
+            "event_date":    date_str,
+            "event_type":    ev.event_type,
+            "event_time":    ev.event_time,
+            "notify_before": ev.notify_before,
+            "note":          ev.note,
+            "created_by":    ev.user_id,
+            "color":         ev_color,
+            "recurrence":    getattr(ev, 'recurrence', 'None') or "None",
+            "family_shared": getattr(ev, 'family_shared', True),
+            "is_mine":       is_self,
+        })
+
+    # Sort by date then time
+    output.sort(key=lambda x: (x["event_date"], x.get("event_time") or ""))
+    return jsonify({"events": output})
+
+
+def _generate_recurrence_dates(base_date, recurrence, month_start, month_end):
+    """Generate all occurrences of a recurring event within [month_start, month_end]."""
+    from dateutil.relativedelta import relativedelta
+    dates = []
+    if not recurrence or recurrence == "None":
+        return dates
+
+    increments = {
+        "Daily":    relativedelta(days=1),
+        "Weekly":   relativedelta(weeks=1),
+        "Bi-Weekly": relativedelta(weeks=2),
+        "Monthly":  relativedelta(months=1),
+        "Yearly":   relativedelta(years=1),
+    }
+    delta = increments.get(recurrence)
+    if not delta:
+        return dates
+
+    # Walk forward from base_date
+    current = base_date
+    # If base_date is way before month_start, jump forward
+    if recurrence == "Daily":
+        if current < month_start:
+            diff = (month_start - current).days
+            current = current + relativedelta(days=diff)
+    elif recurrence == "Weekly":
+        while current < month_start:
+            current += delta
+    elif recurrence == "Bi-Weekly":
+        while current < month_start:
+            current += delta
+    elif recurrence == "Monthly":
+        while current < month_start:
+            current += delta
+    elif recurrence == "Yearly":
+        while current < month_start:
+            current += delta
+
+    # Generate all within range
+    while current <= month_end:
+        if current >= month_start:
+            dates.append(current)
+        current += delta
+
+    return dates
 
 
 @app.route("/calendar/events", methods=["POST"])
@@ -902,10 +1033,32 @@ def add_calendar_event():
         event_time    = data.get("event_time", ""),
         notify_before = data.get("notify_before", "None"),
         note          = data.get("note", ""),
+        color         = data.get("color", ""),
+        recurrence    = data.get("recurrence", "None"),
+        family_shared = data.get("family_shared", True),
     )
     db.session.add(ev)
     db.session.commit()
     return jsonify({"success": True, "id": ev.id}), 201
+
+
+@app.route("/calendar/events/<int:event_id>", methods=["PUT"])
+def update_calendar_event(event_id):
+    ev = CalendarEvent.query.get(event_id)
+    if not ev:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json() or {}
+    ev.title         = data.get("title", ev.title)
+    ev.event_date    = data.get("event_date", ev.event_date)
+    ev.event_type    = data.get("event_type", ev.event_type)
+    ev.event_time    = data.get("event_time", ev.event_time)
+    ev.notify_before = data.get("notify_before", ev.notify_before)
+    ev.note          = data.get("note", ev.note)
+    ev.color         = data.get("color", ev.color)
+    ev.recurrence    = data.get("recurrence", ev.recurrence)
+    ev.family_shared = data.get("family_shared", ev.family_shared)
+    db.session.commit()
+    return jsonify({"success": True})
 
 
 @app.route("/calendar/events/<int:event_id>", methods=["DELETE"])
@@ -1377,6 +1530,26 @@ def migrate_profile_picture():
         return "Profile picture migration successful", 200
     except Exception as e:
         return str(e), 400
+
+
+@app.route("/migrate_calendar")
+def migrate_calendar():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS color VARCHAR(10)"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS recurrence VARCHAR(20) DEFAULT 'None'"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS family_shared BOOLEAN DEFAULT TRUE"
+            ))
+            conn.commit()
+        return "Calendar migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
