@@ -43,6 +43,27 @@ class User(db.Model):
     stripe_customer_id     = db.Column(db.String(100), nullable=True)
     paypal_subscription_id = db.Column(db.String(100), nullable=True)
 
+
+def find_user_by_id(user_id):
+    """Safely look up a user by integer ID or username string.
+    Handles PostgreSQL type strictness (can't compare int column to string)."""
+    if user_id is None:
+        return None
+    user_id = str(user_id).strip()
+    if not user_id:
+        return None
+    # Try integer ID first
+    try:
+        uid_int = int(user_id)
+        user = User.query.filter(User.id == uid_int).first()
+        if user:
+            return user
+    except (ValueError, TypeError):
+        pass
+    # Fall back to username match
+    return User.query.filter(User.username == user_id).first()
+
+
 #===============================================================================
 # Stripe and Paypal
 # ==============================================================================
@@ -79,9 +100,7 @@ def get_paypal_access_token():
 @app.route("/subscription/status", methods=["GET"])
 def subscription_status():
     user_id = request.args.get("user_id")
-    user = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user = find_user_by_id(user_id)
     if not user:
         print(f"[SUB STATUS] User not found: {user_id}")
         return jsonify({"subscribed": False}), 404
@@ -141,9 +160,7 @@ def subscription_status():
 @app.route("/subscription/debug", methods=["GET"])
 def subscription_debug():
     user_id = request.args.get("user_id")
-    user = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user = find_user_by_id(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
@@ -184,9 +201,7 @@ def stripe_create_session():
     try:
         data    = request.get_json() or {}
         user_id = str(data.get("user_id", ""))
-        user    = User.query.filter(
-            (User.id == user_id) | (User.username == user_id)
-        ).first()
+        user    = find_user_by_id(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
  
@@ -347,9 +362,7 @@ def paypal_create_subscription():
     try:
         data    = request.get_json() or {}
         user_id = str(data.get("user_id", ""))
-        user    = User.query.filter(
-            (User.id == user_id) | (User.username == user_id)
-        ).first()
+        user    = find_user_by_id(user_id)
         if not user:
             return jsonify({"error": "User not found"}), 404
  
@@ -919,6 +932,25 @@ except Exception as e:
 def home():
     return "API running", 200
 
+@app.route("/lookup")
+def lookup_user():
+    email = request.args.get("email", "").strip().lower()
+    username = request.args.get("username", "").strip()
+    if not email and not username:
+        return jsonify({"error": "Provide ?email=... or ?username=..."}), 400
+    user = User.query.filter(
+        (User.email == email) | (User.username == username)
+    ).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "stripe_customer_id": user.stripe_customer_id,
+        "is_subscribed": user.is_subscribed or False,
+    })
+
 @app.route("/signup", methods=["POST"])
 def signup():
     data     = request.get_json()
@@ -985,9 +1017,7 @@ def login():
 def update_profile():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
-    user    = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False, "message": "User not found"}), 404
  
@@ -1011,9 +1041,7 @@ def update_profile():
 def change_password():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
-    user    = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False, "message": "User not found"}), 404
  
@@ -1031,9 +1059,7 @@ def change_password():
 def remove_bank():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
-    user    = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
     user.plaid_access_token = None
@@ -1053,9 +1079,7 @@ def report_bug():
 def delete_account():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
-    user    = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
  
@@ -1075,9 +1099,7 @@ def delete_account():
 def cancel_subscription():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
-    user    = User.query.filter(
-        (User.id == user_id) | (User.username == user_id)
-    ).first()
+    user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
  
@@ -1129,9 +1151,7 @@ def exchange_token():
         response     = plaid_client.item_public_token_exchange(req)
         access_token = response["access_token"]
 
-        user = User.query.filter(
-            (User.id == user_id) | (User.username == user_id)
-        ).first()
+        user = find_user_by_id(user_id)
         if user:
             user.plaid_access_token = access_token
             db.session.commit()
@@ -1155,9 +1175,7 @@ def get_accounts():
             else:
                 member_ids = [uid_int]
         except (ValueError, TypeError):
-            user = User.query.filter(
-                (User.id == user_id) | (User.username == user_id)
-            ).first()
+            user = find_user_by_id(user_id)
             member_ids = [user.id] if user else []
  
         all_accounts = []
@@ -1185,9 +1203,7 @@ def get_accounts():
 def get_transactions():
     try:
         user_id = request.args.get("user_id")
-        user    = User.query.filter(
-            (User.id == user_id) | (User.username == user_id)
-        ).first()
+        user    = find_user_by_id(user_id)
 
         if not user or not user.plaid_access_token:
             return jsonify({"transactions": []})
