@@ -16,6 +16,7 @@ from plaid.model.transactions_get_request_options import TransactionsGetRequestO
 from plaid.model.country_code import CountryCode
 from plaid.model.products import Products
 import stripe
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -113,9 +114,9 @@ def stripe_create_session():
             customer_id = user.stripe_customer_id
         else:
             customer = stripe.Customer.create(
-            email=user.email if "@" in (user.email or "") else None,
-            metadata={"user_id": str(user.id)}
-        )
+                email=user.email if "@" in (user.email or "") else None,
+                metadata={"user_id": str(user.id)}
+            )
             user.stripe_customer_id = customer.id
             db.session.commit()
             customer_id = customer.id
@@ -765,12 +766,16 @@ _env_map = {
     "production": plaid.Environment.Production,
 }
 
-configuration = plaid.Configuration(
-    host=_env_map.get(PLAID_ENV, plaid.Environment.Sandbox),
-    api_key={"clientId": PLAID_CLIENT_ID, "secret": PLAID_SECRET},
-)
-api_client   = plaid.ApiClient(configuration)
-plaid_client = plaid_api.PlaidApi(api_client)
+plaid_client = None
+try:
+    configuration = plaid.Configuration(
+        host=_env_map.get(PLAID_ENV, plaid.Environment.Sandbox),
+        api_key={"clientId": PLAID_CLIENT_ID, "secret": PLAID_SECRET},
+    )
+    api_client   = plaid.ApiClient(configuration)
+    plaid_client = plaid_api.PlaidApi(api_client)
+except Exception as e:
+    print(f"Warning: Plaid client init failed ({e}). Plaid routes will be unavailable.")
 
 
 # ── Core routes ───────────────────────────────────────────────────────────────
@@ -1144,4 +1149,3 @@ def migrate_subscription():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
- 
