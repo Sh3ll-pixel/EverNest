@@ -179,16 +179,71 @@ def stripe_webhook():
 # ── Stripe: success / cancel redirect pages ───────────────────────────────────
 @app.route("/subscription/success")
 def subscription_success():
-    return """
-    <html><body style="background:#23272D;color:#96abff;font-family:Arial;
-    display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
-    <div>
-      <div style="font-size:48px;margin-bottom:16px;">✓</div>
-      <h2 style="color:#4CFF7A;font-size:24px;margin-bottom:8px;">Subscription Active!</h2>
-      <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
-      Close this tab and reopen the app to get started.</p>
-    </div></body></html>
-    """, 200, {"Content-Type": "text/html"}
+    session_id = request.args.get("session_id")
+    activated = False
+
+    if session_id:
+        try:
+            # Retrieve the checkout session from Stripe to confirm payment
+            session = stripe.checkout.Session.retrieve(session_id)
+
+            if session.payment_status == "paid":
+                # Find the user via the metadata we attached when creating the session
+                user_id = session.metadata.get("user_id")
+                user = User.query.get(int(user_id)) if user_id else None
+
+                # Fallback: find by stripe customer id
+                if not user and session.customer:
+                    user = User.query.filter_by(
+                        stripe_customer_id=str(session.customer)
+                    ).first()
+
+                if user and not user.is_subscribed:
+                    user.is_subscribed = True
+                    # Try to get the subscription period end from Stripe
+                    try:
+                        sub = stripe.Subscription.retrieve(session.subscription)
+                        user.subscription_end = datetime.datetime.utcfromtimestamp(
+                            sub.current_period_end
+                        )
+                    except Exception:
+                        user.subscription_end = (
+                            datetime.datetime.utcnow() + datetime.timedelta(days=31)
+                        )
+
+                    # Store stripe customer id if not already saved
+                    if session.customer and not user.stripe_customer_id:
+                        user.stripe_customer_id = str(session.customer)
+
+                    db.session.commit()
+                    activated = True
+                elif user and user.is_subscribed:
+                    activated = True  # Already active
+        except Exception as e:
+            print(f"Subscription activation error: {e}")
+
+    if activated:
+        return """
+        <html><body style="background:#23272D;color:#96abff;font-family:Arial;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
+        <div>
+          <div style="font-size:48px;margin-bottom:16px;">✓</div>
+          <h2 style="color:#4CFF7A;font-size:24px;margin-bottom:8px;">Subscription Active!</h2>
+          <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
+          Close this tab and click <b>Refresh</b> in EverNest.</p>
+        </div></body></html>
+        """, 200, {"Content-Type": "text/html"}
+    else:
+        return """
+        <html><body style="background:#23272D;color:#96abff;font-family:Arial;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;">
+        <div>
+          <div style="font-size:48px;margin-bottom:16px;">⏳</div>
+          <h2 style="color:#FFD700;font-size:24px;margin-bottom:8px;">Processing...</h2>
+          <p style="color:#9A9A9A;">Your payment is being confirmed.<br>
+          Close this tab, wait a moment, then click <b>Refresh</b> in EverNest.</p>
+        </div></body></html>
+        """, 200, {"Content-Type": "text/html"}
  
  
 @app.route("/subscription/cancel")
