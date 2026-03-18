@@ -31,6 +31,63 @@ _sub_cache = {"subscribed": False, "checked": False}
 # Profile picture cache  {user_id_str: CTkImage or None}
 _pfp_cache = {}
 
+# Accent color system
+_accent_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".evernest_accent.txt")
+_accent = {"color": "#3b5bdb", "widgets": []}  # widgets = list of (widget, role) to update live
+
+# Notification tracking — global so it persists across tab switches
+# Stores tuples of (event_id, date_str) to allow recurring events on different days
+_notified_events = set()
+
+def _load_accent_color():
+    try:
+        if os.path.exists(_accent_config_path):
+            with open(_accent_config_path, "r") as f:
+                c = f.read().strip()
+                if c.startswith("#") and len(c) in (4, 7):
+                    _accent["color"] = c
+    except Exception:
+        pass
+
+def _save_accent_color(color):
+    _accent["color"] = color
+    try:
+        with open(_accent_config_path, "w") as f:
+            f.write(color)
+    except Exception:
+        pass
+
+def _apply_accent_to_widgets():
+    """Update all registered widgets with the current accent color."""
+    color = _accent["color"]
+    # Compute a slightly darker hover color
+    try:
+        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+        hover = f"#{max(0,r-30):02x}{max(0,g-30):02x}{max(0,b-30):02x}"
+    except Exception:
+        hover = color
+
+    for widget, role in _accent["widgets"]:
+        try:
+            if not widget.winfo_exists():
+                continue
+            if role == "button":
+                widget.configure(fg_color=color, hover_color=hover)
+            elif role == "active_nav":
+                widget.configure(fg_color=color)
+            elif role == "text":
+                widget.configure(text_color=color)
+            elif role == "progress":
+                widget.configure(progress_color=color)
+        except Exception:
+            pass
+
+def register_accent_widget(widget, role="button"):
+    """Register a widget to be updated when accent color changes."""
+    _accent["widgets"].append((widget, role))
+
+_load_accent_color()
+
 
 def b64_to_ctk_image(b64_string, size=(40, 40)):
     """Convert a base64 JPEG string into a circular CTkImage."""
@@ -154,13 +211,17 @@ def render_main_application(app_window, user_data=None):
     sidebar.place(x=0, y=0)
 
     # Thin accent line on right edge of sidebar
-    ctk.CTkFrame(app_window, fg_color="#2a2f38", width=1, height=680, corner_radius=0).place(x=220, y=0)
+    sidebar_accent_line = ctk.CTkFrame(app_window, fg_color=_accent["color"], width=2, height=680, corner_radius=0)
+    sidebar_accent_line.place(x=219, y=0)
+    register_accent_widget(sidebar_accent_line, "active_nav")
 
-    ctk.CTkLabel(
+    brand_label = ctk.CTkLabel(
         sidebar, text="⬡  EverNest",
         fg_color="transparent", width=180, height=40,
-        text_color="#7B93DB", font=ctk.CTkFont(size=22, weight="bold")
-    ).place(x=20, y=24)
+        text_color=_accent["color"], font=ctk.CTkFont(size=22, weight="bold")
+    )
+    brand_label.place(x=20, y=24)
+    register_accent_widget(brand_label, "text")
 
     # Subtle divider below logo
     ctk.CTkFrame(sidebar, fg_color="#252830", height=1, width=180).place(x=20, y=72)
@@ -188,7 +249,7 @@ def render_main_application(app_window, user_data=None):
     def set_active_nav(tab_name):
         for name, btn in nav_buttons.items():
             if name == tab_name:
-                btn.configure(fg_color="#1e2a42", text_color="#7B93DB",
+                btn.configure(fg_color="#1e2a42", text_color=_accent["color"],
                               border_width=0)
             else:
                 btn.configure(fg_color="transparent", text_color="#6b7280",
@@ -202,7 +263,7 @@ def render_main_application(app_window, user_data=None):
         for w in content_frame.winfo_children():
             w.destroy()
         if tab_name == "Dashboard":
-            render_dashboard_tab(content_frame, username, email, user_data)
+            render_dashboard_tab(content_frame, username, email, user_data, switch_tab_fn=switch_tab)
         elif tab_name == "Financial":
             render_financial_tab(content_frame, user_data, switch_tab_fn=switch_tab)
         elif tab_name == "Calendar":
@@ -564,24 +625,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
     #  APPEARANCE
     # =========================================================================
     section_header("🎨  Appearance")
- 
-    # Dark/Light mode
-    appearance_var = ctk.StringVar(value=ctk.get_appearance_mode())
-    def appearance_widget(row):
-        def toggle():
-            current = ctk.get_appearance_mode()
-            new_mode = "Light" if current == "Dark" else "Dark"
-            ctk.set_appearance_mode(new_mode)
-            appearance_var.set(new_mode)
-            btn.configure(text=f"{'🌙' if new_mode == 'Dark' else '☀️'}  {new_mode} Mode")
-        btn = ctk.CTkButton(row, text=f"{'🌙' if ctk.get_appearance_mode() == 'Dark' else '☀️'}  {ctk.get_appearance_mode()} Mode",
-                             width=160, height=32,
-                             fg_color="#252830", hover_color="#2b4bc8",
-                             text_color="#7B93DB", corner_radius=8,
-                             command=toggle)
-        btn.pack(side="left")
-    setting_row("Theme", appearance_widget)
- 
+
     # Accent color
     ACCENT_COLORS = [
         ("#3b5bdb", "Blue"),
@@ -591,21 +635,32 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
         ("#C084FC", "Purple"),
         ("#FF9F40", "Orange"),
         ("#7B93DB", "Lavender"),
+        ("#38bdf8", "Sky"),
+        ("#fb7185", "Pink"),
     ]
- 
+
     def accent_widget(row):
+        accent_rings = []
+
+        def pick_accent(hex_color, name):
+            _save_accent_color(hex_color)
+            _apply_accent_to_widgets()
+            # Update selection rings
+            for ring, c in accent_rings:
+                ring.configure(fg_color="#ffffff" if c == hex_color else "transparent")
+            status_var.set(f"✓  Accent color set to {name} — switch tabs to see it")
+
         for color, name in ACCENT_COLORS:
-            def make_cmd(c=color):
-                def cmd():
-                    ctk.set_default_color_theme("blue")
-                    status_var.set(f"Accent color changed to {name} — restart app to fully apply.")
-                return cmd
-            btn = ctk.CTkButton(row, text="", width=28, height=28,
-                                 fg_color=color, hover_color=color,
-                                 corner_radius=14, border_width=2,
-                                 border_color="#13161b",
-                                 command=make_cmd(color))
-            btn.pack(side="left", padx=3, pady=8)
+            ring = ctk.CTkFrame(row, fg_color="#ffffff" if color == _accent["color"] else "transparent",
+                                 width=32, height=32, corner_radius=16)
+            ring.pack(side="left", padx=2, pady=6)
+            inner = ctk.CTkButton(ring, text="", width=24, height=24,
+                                   fg_color=color, hover_color=color,
+                                   corner_radius=12,
+                                   command=lambda c=color, n=name: pick_accent(c, n))
+            inner.place(relx=0.5, rely=0.5, anchor="center")
+            accent_rings.append((ring, color))
+
     setting_row("Accent Color", accent_widget)
  
     # =========================================================================
@@ -768,244 +823,504 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
 #  DASHBOARD TAB
 # =============================================================================
 
-def render_dashboard_tab(parent, username, email, user_data=None):
-    # ── Greeting ──────────────────────────────────────────────────────────────
+def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=None):
+    import tkinter as tk
+
+    user_id = ""
+    if user_data:
+        user_id = str(user_data.get("id") or user_data.get("username", ""))
+
+    # ── Time-based greeting ───────────────────────────────────────────────────
+    hour = datetime.datetime.now().hour
+    if hour < 12:
+        greeting = f"Good morning, {username}"
+    elif hour < 17:
+        greeting = f"Good afternoon, {username}"
+    else:
+        greeting = f"Good evening, {username}"
+
     ctk.CTkLabel(
-        parent, text=f"Welcome back, {username}",
-        fg_color="transparent", width=400, height=36,
+        parent, text=greeting,
+        fg_color="transparent", width=400, height=32,
         text_color="#e5e7eb", font=ctk.CTkFont(size=22, weight="bold")
-    ).place(x=32, y=24)
+    ).place(x=32, y=16)
+
+    today_str = datetime.date.today().strftime("%A, %B %d, %Y")
     ctk.CTkLabel(
-        parent, text=email,
-        fg_color="transparent", width=300, height=20,
+        parent, text=today_str,
+        fg_color="transparent", width=300, height=18,
         text_color="#4b5563", font=ctk.CTkFont(size=12)
-    ).place(x=32, y=56)
+    ).place(x=32, y=46)
+
+    # ── Setup banner for new users (hidden by default) ────────────────────────
+    setup_banner = ctk.CTkFrame(parent, fg_color="#1a2232", width=400, height=36,
+                                  corner_radius=8, border_width=1, border_color="#263354")
+    setup_banner.place(x=440, y=20)
+    setup_banner.place_forget()
+
+    banner_label = ctk.CTkLabel(setup_banner, text="", fg_color="transparent",
+                                 text_color="#8b9cf7", font=ctk.CTkFont(size=11))
+    banner_label.place(x=12, y=7)
+
+    banner_btn = ctk.CTkButton(setup_banner, text="Set up →", width=70, height=24,
+                                fg_color=_accent["color"], hover_color="#2b4bc8",
+                                text_color="#ffffff", corner_radius=6,
+                                font=ctk.CTkFont(size=10, weight="bold"),
+                                command=lambda: switch_tab_fn("Settings") if switch_tab_fn else None)
+    banner_btn.place(x=318, y=6)
 
     # ── Stat cards ────────────────────────────────────────────────────────────
     card_data = [
-        ("Net Worth",    "Loading…", "Across all accounts",   "💵"),
-        ("Coming Up",    "Loading…", "Upcoming appointments", "📆"),
-        ("Secure Vault", "Ready",    "Encrypted & online",    "🔐"),
+        ("💵", "Net Worth",  "Loading…"),
+        ("📆", "Next Event", "Loading…"),
+        ("🌡️", "Weather",    "Loading…"),
     ]
     cx = 32
-    card_value_labels = []
-    for title, value, sub, icon in card_data:
-        card = ctk.CTkFrame(parent, fg_color="#1f2328", width=260, height=116,
-                             corner_radius=12, border_width=1, border_color="#2a2f38")
-        card.place(x=cx, y=92)
+    card_labels = {}
+    for icon, title, default_val in card_data:
+        card = ctk.CTkFrame(parent, fg_color="#1f2328", width=270, height=100,
+                             corner_radius=10, border_width=1, border_color="#2a2f38")
+        card.place(x=cx, y=70)
 
         ctk.CTkLabel(card, text=icon, fg_color="transparent",
-                     font=ctk.CTkFont(size=20)).place(x=18, y=14)
+                     font=ctk.CTkFont(size=18)).place(x=14, y=10)
         ctk.CTkLabel(card, text=title, fg_color="transparent",
-                     text_color="#7B93DB", font=ctk.CTkFont(size=12)).place(x=48, y=16)
+                     text_color="#6b7280", font=ctk.CTkFont(size=11)).place(x=40, y=12)
 
-        val_label = ctk.CTkLabel(card, text=value, fg_color="transparent",
-                     text_color="#e5e7eb", font=ctk.CTkFont(size=22, weight="bold"))
-        val_label.place(x=18, y=50)
+        val = ctk.CTkLabel(card, text=default_val, fg_color="transparent",
+                     text_color="#e5e7eb", font=ctk.CTkFont(size=20, weight="bold"))
+        val.place(x=14, y=42)
 
-        ctk.CTkLabel(card, text=sub, fg_color="transparent",
-                     text_color="#4b5563", font=ctk.CTkFont(size=11)).place(x=18, y=86)
+        sub = ctk.CTkLabel(card, text="", fg_color="transparent",
+                     text_color="#4b5563", font=ctk.CTkFont(size=10))
+        sub.place(x=14, y=74)
 
-        card_value_labels.append(val_label)
-        cx += 276
+        card_labels[title] = {"val": val, "sub": sub}
+        cx += 282
 
-    # Fetch net worth from Plaid in background
-    def fetch_net_worth():
-        try:
-            params = {}
-            if user_data:
-                params["user_id"] = user_data.get("id") or user_data.get("username", "")
-            resp = requests.get(f"{API_BASE}/plaid/accounts", params=params, timeout=10)
-            if resp.ok:
-                accounts = resp.json().get("accounts", [])
-                net = sum((a.get("balances", {}).get("current") or 0) for a in accounts)
-                text  = f"${net:,.2f}"
-                color = "#4CFF7A" if net >= 0 else "#FF6B6B"
-            else:
-                text, color = "Unavailable", "#4b5060"
-        except Exception:
-            text, color = "Unavailable", "#4b5060"
+    # ── Net Worth Chart (left) ────────────────────────────────────────────────
+    chart_frame = ctk.CTkFrame(parent, fg_color="#1f2328", width=420, height=280,
+                                corner_radius=10, border_width=1, border_color="#2a2f38")
+    chart_frame.place(x=32, y=184)
 
-        def _update():
-            if card_value_labels[0].winfo_exists():
-                card_value_labels[0].configure(text=text, text_color=color)
-        parent.after(0, _update)
+    ctk.CTkLabel(chart_frame, text="Net Worth — Last 30 Days", fg_color="transparent",
+                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=10)
 
-    threading.Thread(target=fetch_net_worth, daemon=True).start()
+    chart_canvas = tk.Canvas(chart_frame, width=390, height=220, bg="#1f2328",
+                              highlightthickness=0, bd=0)
+    chart_canvas.place(x=14, y=46)
 
-    def fetch_next_event():
-        try:
-            params = {}
-            if user_data:
-                params["user_id"] = user_data.get("id") or user_data.get("username", "")
-            today = datetime.date.today()
-            params["year"]  = today.year
-            params["month"] = today.month
-            resp = requests.get(f"{API_BASE}/calendar/events", params=params, timeout=10)
-            if resp.ok:
-                events = resp.json().get("events", [])
-                today_str = today.isoformat()
-                upcoming  = [e for e in events if e.get("event_date", "") >= today_str]
-                upcoming.sort(key=lambda e: (e.get("event_date", ""), e.get("event_time", "")))
-                if upcoming:
-                    next_ev   = upcoming[0]
-                    ev_date   = next_ev.get("event_date", "")
-                    ev_title  = next_ev.get("title", "")
-                    ev_time   = next_ev.get("event_time", "")
-                    date_obj  = datetime.date.fromisoformat(ev_date)
-                    if date_obj == today:
-                        date_label = "Today"
-                    elif date_obj == today + datetime.timedelta(days=1):
-                        date_label = "Tomorrow"
-                    else:
-                        date_label = date_obj.strftime("%b %d")
-                    text = f"{date_label} — {ev_title}"
-                    if ev_time:
-                        text += f"\n{ev_time}"
+    def draw_line_chart(snapshots):
+        chart_canvas.delete("all")
+        cw, ch = 390, 220
+        pad_l, pad_r, pad_t, pad_b = 55, 15, 10, 28
+
+        if not snapshots or len(snapshots) < 2:
+            chart_canvas.create_text(cw // 2, ch // 2, text="Not enough data yet",
+                                      fill="#4b5563", font=("Arial", 12))
+            chart_canvas.create_text(cw // 2, ch // 2 + 20,
+                                      text="Check back tomorrow",
+                                      fill="#3d4456", font=("Arial", 10))
+            return
+
+        values = [s["net_worth"] for s in snapshots]
+        dates  = [s["date"] for s in snapshots]
+        v_min  = min(values)
+        v_max  = max(values)
+        if v_max == v_min:
+            v_max = v_min + 100
+
+        draw_w = cw - pad_l - pad_r
+        draw_h = ch - pad_t - pad_b
+
+        # Grid lines + Y labels
+        for i in range(5):
+            y = pad_t + draw_h - (i / 4) * draw_h
+            val = v_min + (i / 4) * (v_max - v_min)
+            chart_canvas.create_line(pad_l, y, cw - pad_r, y, fill="#2a2f38", width=1)
+            label = f"${val/1000:.1f}k" if val >= 1000 else f"${val:.0f}"
+            chart_canvas.create_text(pad_l - 6, y, text=label, fill="#4b5563",
+                                      font=("Arial", 9), anchor="e")
+
+        # Points
+        points = []
+        for i, v in enumerate(values):
+            x = pad_l + (i / max(len(values) - 1, 1)) * draw_w
+            y = pad_t + draw_h - ((v - v_min) / (v_max - v_min)) * draw_h
+            points.append((x, y))
+
+        accent = _accent["color"]
+        if len(points) >= 2:
+            # Fill under curve
+            fill_pts = list(points) + [(points[-1][0], pad_t + draw_h),
+                                        (points[0][0], pad_t + draw_h)]
+            chart_canvas.create_polygon(
+                *[c for p in fill_pts for c in p],
+                fill=accent, outline="", stipple="gray25")
+            # Line
+            chart_canvas.create_line(
+                *[c for p in points for c in p],
+                fill=accent, width=2, smooth=True)
+
+        for x, y in points:
+            chart_canvas.create_oval(x-3, y-3, x+3, y+3,
+                                      fill=accent, outline="#1f2328", width=1)
+
+        # X labels
+        for idx in [0, len(dates)//2, len(dates)-1]:
+            if idx < len(dates):
+                x = pad_l + (idx / max(len(dates)-1, 1)) * draw_w
+                try:
+                    d = datetime.date.fromisoformat(dates[idx])
+                    label = d.strftime("%b %d")
+                except Exception:
+                    label = dates[idx][-5:]
+                chart_canvas.create_text(x, ch-8, text=label, fill="#4b5563",
+                                          font=("Arial", 9))
+
+    # ── Upcoming Events (right) ───────────────────────────────────────────────
+    events_frame = ctk.CTkFrame(parent, fg_color="#1f2328", width=410, height=280,
+                                  corner_radius=10, border_width=1, border_color="#2a2f38")
+    events_frame.place(x=466, y=184)
+
+    ctk.CTkLabel(events_frame, text="Upcoming — Next 7 Days", fg_color="transparent",
+                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=10)
+
+    events_scroll = ctk.CTkScrollableFrame(events_frame, fg_color="transparent",
+                                             width=378, height=224)
+    events_scroll.place(x=8, y=40)
+
+    def render_upcoming_events(events):
+        for w in events_scroll.winfo_children():
+            w.destroy()
+        if not events:
+            ctk.CTkLabel(events_scroll, text="No events in the next 7 days",
+                          fg_color="transparent", text_color="#4b5563",
+                          font=ctk.CTkFont(size=12)).pack(pady=20)
+            if switch_tab_fn:
+                ctk.CTkButton(events_scroll, text="＋  Add an event",
+                               fg_color=_accent["color"], hover_color="#2b4bc8",
+                               width=180, height=30, text_color="#ffffff",
+                               corner_radius=8, font=ctk.CTkFont(size=12),
+                               command=lambda: switch_tab_fn("Calendar")).pack(pady=4)
+            return
+
+        today = datetime.date.today()
+        for ev in events[:8]:
+            row = ctk.CTkFrame(events_scroll, fg_color="#161a1f", corner_radius=6, height=44)
+            row.pack(fill="x", pady=2, padx=2)
+            row.pack_propagate(False)
+
+            color = ev.get("color", "#7B93DB")
+            ctk.CTkFrame(row, fg_color=color, width=4, height=44, corner_radius=2).place(x=0, y=0)
+
+            try:
+                ev_date = datetime.date.fromisoformat(ev.get("event_date", ""))
+                if ev_date == today:
+                    date_text = "Today"
+                elif ev_date == today + datetime.timedelta(days=1):
+                    date_text = "Tmrw"
                 else:
-                    text = "No upcoming events"
-            else:
-                text = "Unavailable"
-        except Exception:
-            text = "Unavailable"
+                    date_text = ev_date.strftime("%a %d")
+            except Exception:
+                date_text = "—"
 
-        def _update():
-            if card_value_labels[1].winfo_exists():
-                card_value_labels[1].configure(text=text, font=ctk.CTkFont(size=13, weight="bold"))
-        parent.after(0, _update)
+            ctk.CTkLabel(row, text=date_text, fg_color="transparent",
+                          text_color="#6b7280", font=ctk.CTkFont(size=10, weight="bold"),
+                          width=42).place(x=10, y=4)
+            ctk.CTkLabel(row, text=ev.get("title", ""), fg_color="transparent",
+                          text_color="#d1d5db", font=ctk.CTkFont(size=12, weight="bold"),
+                          anchor="w").place(x=58, y=4)
+            time_text = ev.get("event_time", "")
+            type_text = ev.get("event_type", "")
+            meta = f"{type_text}  •  {time_text}" if time_text else type_text
+            ctk.CTkLabel(row, text=meta, fg_color="transparent",
+                          text_color="#4b5563", font=ctk.CTkFont(size=10),
+                          anchor="w").place(x=58, y=24)
 
-    threading.Thread(target=fetch_next_event, daemon=True).start()
+    # ── Budget Progress (bottom left) ─────────────────────────────────────────
+    budget_frame = ctk.CTkFrame(parent, fg_color="#1f2328", width=420, height=178,
+                                  corner_radius=10, border_width=1, border_color="#2a2f38")
+    budget_frame.place(x=32, y=478)
 
-    activity_panel = ctk.CTkFrame(parent, fg_color="#1f2328", width=840, height=360,
-                                   corner_radius=12, border_width=1, border_color="#2a2f38")
-    activity_panel.place(x=32, y=230)
-    ctk.CTkLabel(activity_panel, text="System Overview", fg_color="transparent",
-                 text_color="#e5e7eb", font=ctk.CTkFont(size=16, weight="bold")).place(x=24, y=18)
-    ctk.CTkFrame(activity_panel, fg_color="#2a2f38", height=1, width=580).place(x=24, y=50)
+    ctk.CTkLabel(budget_frame, text="Budget This Month", fg_color="transparent",
+                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=10)
 
-    status_items = [
-        ("✓", "Password vault synced",              "#34d399"),
-        ("✓", "Notifications system standing by",    "#34d399"),
-        ("✓", "Family data categories ready",        "#34d399"),
-        ("✓", "Dashboard loaded successfully",       "#34d399"),
-    ]
-    for i, (icon, text, color) in enumerate(status_items):
-        y = 66 + i * 38
-        ctk.CTkLabel(activity_panel, text=icon, fg_color="transparent",
-                     text_color=color, font=ctk.CTkFont(size=13, weight="bold")).place(x=28, y=y)
-        ctk.CTkLabel(activity_panel, text=text, fg_color="transparent",
-                     text_color="#9ca3af", font=ctk.CTkFont(size=13)).place(x=52, y=y)
+    budget_content = ctk.CTkFrame(budget_frame, fg_color="transparent", width=396, height=130)
+    budget_content.place(x=12, y=38)
 
-    # ── Weather card ──────────────────────────────────────────────────────────
-    weather_card = ctk.CTkFrame(activity_panel, fg_color="#161a1f", width=220, height=290,
+    def render_budget_progress(budget_data, transactions):
+        for w in budget_content.winfo_children():
+            w.destroy()
+        if not budget_data or budget_data.get("income", 0) <= 0:
+            ctk.CTkLabel(budget_content, text="No budget set up yet",
+                          fg_color="transparent", text_color="#4b5563",
+                          font=ctk.CTkFont(size=12)).pack(pady=16)
+            if switch_tab_fn:
+                ctk.CTkButton(budget_content, text="Set up budget →",
+                               fg_color=_accent["color"], hover_color="#2b4bc8",
+                               width=140, height=28, text_color="#ffffff",
+                               corner_radius=6, font=ctk.CTkFont(size=11),
+                               command=lambda: switch_tab_fn("Budget")).pack(pady=4)
+            return
+
+        income     = budget_data.get("income", 0)
+        categories = budget_data.get("categories", {})
+        spent_by_cat = {}
+        for txn in transactions:
+            cat = (txn.get("personal_finance_category", {}) or {}).get("primary", "OTHER")
+            amt = abs(txn.get("amount", 0))
+            spent_by_cat[cat] = spent_by_cat.get(cat, 0) + amt
+        total_spent = sum(spent_by_cat.values())
+
+        overall_row = ctk.CTkFrame(budget_content, fg_color="transparent")
+        overall_row.pack(fill="x", padx=4, pady=(0, 6))
+        pct = min(total_spent / income, 1.0) if income > 0 else 0
+        color = "#4ade80" if pct < 0.75 else ("#FFD700" if pct < 0.95 else "#f87171")
+
+        ctk.CTkLabel(overall_row, text=f"Total Spent: ${total_spent:,.0f} / ${income:,.0f}",
+                      fg_color="transparent", text_color="#d1d5db",
+                      font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+        ctk.CTkLabel(overall_row, text=f"{pct*100:.0f}%",
+                      fg_color="transparent", text_color=color,
+                      font=ctk.CTkFont(size=12, weight="bold")).pack(side="right")
+
+        bar_bg = ctk.CTkFrame(budget_content, fg_color="#161a1f", height=10, corner_radius=5)
+        bar_bg.pack(fill="x", padx=4, pady=(0, 8))
+        if pct > 0:
+            ctk.CTkFrame(bar_bg, fg_color=color,
+                          width=max(int(392 * pct), 4), height=10,
+                          corner_radius=5).place(x=0, y=0)
+
+        if categories:
+            sorted_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:3]
+            for cat_name, budgeted in sorted_cats:
+                spent = spent_by_cat.get(cat_name.upper(), spent_by_cat.get(cat_name, 0))
+                cat_pct = min(spent / budgeted, 1.0) if budgeted > 0 else 0
+                cat_color = "#4ade80" if cat_pct < 0.75 else ("#FFD700" if cat_pct < 0.95 else "#f87171")
+                row = ctk.CTkFrame(budget_content, fg_color="transparent", height=22)
+                row.pack(fill="x", padx=4, pady=1)
+                ctk.CTkLabel(row, text=f"{cat_name}: ${spent:,.0f}/${budgeted:,.0f}",
+                              fg_color="transparent", text_color="#6b7280",
+                              font=ctk.CTkFont(size=10)).pack(side="left")
+                ctk.CTkLabel(row, text=f"{cat_pct*100:.0f}%",
+                              fg_color="transparent", text_color=cat_color,
+                              font=ctk.CTkFont(size=10, weight="bold")).pack(side="right")
+
+    # ── Weather (bottom right) ────────────────────────────────────────────────
+    weather_card = ctk.CTkFrame(parent, fg_color="#1f2328", width=410, height=178,
                                  corner_radius=10, border_width=1, border_color="#2a2f38")
-    weather_card.place(x=596, y=48)
+    weather_card.place(x=466, y=478)
 
     ctk.CTkLabel(weather_card, text="Local Weather", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=12, weight="bold")).place(x=14, y=12)
+                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=10)
 
-    weather_icon  = ctk.CTkLabel(weather_card, text="…", fg_color="transparent",
-                                  text_color="#f0f1f3", font=ctk.CTkFont(size=42))
-    weather_icon.place(x=14, y=44)
-
-    weather_temp  = ctk.CTkLabel(weather_card, text="--°F", fg_color="transparent",
-                                  text_color="#e5e7eb", font=ctk.CTkFont(size=28, weight="bold"))
-    weather_temp.place(x=14, y=100)
-
-    weather_desc  = ctk.CTkLabel(weather_card, text="Fetching…", fg_color="transparent",
-                                  text_color="#6b7280", font=ctk.CTkFont(size=12))
-    weather_desc.place(x=14, y=140)
-
-    weather_city  = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
-                                  text_color="#7B93DB", font=ctk.CTkFont(size=11))
-    weather_city.place(x=14, y=162)
-
-    weather_hi    = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
-                                  text_color="#6b7280", font=ctk.CTkFont(size=11))
-    weather_hi.place(x=14, y=190)
-
-    weather_wind  = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
-                                  text_color="#6b7280", font=ctk.CTkFont(size=11))
-    weather_wind.place(x=14, y=210)
-
-    weather_humid = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
-                                  text_color="#9A9A9A", font=ctk.CTkFont(size=11))
-    weather_humid.place(x=14, y=230)
+    weather_icon = ctk.CTkLabel(weather_card, text="…", fg_color="transparent",
+                                 text_color="#f0f1f3", font=ctk.CTkFont(size=42))
+    weather_icon.place(x=16, y=40)
+    weather_temp = ctk.CTkLabel(weather_card, text="--°F", fg_color="transparent",
+                                 text_color="#e5e7eb", font=ctk.CTkFont(size=26, weight="bold"))
+    weather_temp.place(x=80, y=48)
+    weather_desc = ctk.CTkLabel(weather_card, text="Fetching…", fg_color="transparent",
+                                 text_color="#6b7280", font=ctk.CTkFont(size=12))
+    weather_desc.place(x=80, y=80)
+    weather_city = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
+                                 text_color="#5b6ef7", font=ctk.CTkFont(size=11))
+    weather_city.place(x=16, y=108)
+    weather_details = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
+                                    text_color="#4b5563", font=ctk.CTkFont(size=11))
+    weather_details.place(x=16, y=130)
+    weather_extra = ctk.CTkLabel(weather_card, text="", fg_color="transparent",
+                                  text_color="#4b5563", font=ctk.CTkFont(size=11))
+    weather_extra.place(x=16, y=150)
 
     WMO_ICONS = {
-        0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️",
-        45: "🌫️", 48: "🌫️",
-        51: "🌦️", 53: "🌦️", 55: "🌧️",
-        61: "🌧️", 63: "🌧️", 65: "🌧️",
-        71: "🌨️", 73: "🌨️", 75: "❄️",
-        80: "🌦️", 81: "🌧️", 82: "⛈️",
-        95: "⛈️", 96: "⛈️", 99: "⛈️",
+        0:"☀️",1:"🌤️",2:"⛅",3:"☁️",45:"🌫️",48:"🌫️",51:"🌦️",53:"🌦️",55:"🌧️",
+        61:"🌧️",63:"🌧️",65:"🌧️",71:"🌨️",73:"🌨️",75:"❄️",
+        80:"🌦️",81:"🌧️",82:"⛈️",95:"⛈️",96:"⛈️",99:"⛈️",
     }
+    WMO_DESCS = {
+        0:"Clear Sky",1:"Mostly Clear",2:"Partly Cloudy",3:"Overcast",
+        45:"Foggy",48:"Foggy",51:"Light Drizzle",53:"Drizzle",55:"Heavy Drizzle",
+        61:"Light Rain",63:"Rain",65:"Heavy Rain",71:"Light Snow",73:"Snow",75:"Heavy Snow",
+        80:"Showers",81:"Heavy Showers",82:"Violent Showers",
+        95:"Thunderstorm",96:"Thunderstorm",99:"Thunderstorm",
+    }
+
+    # ── Fetch all data ────────────────────────────────────────────────────────
+    def fetch_all_data():
+        has_bank = False
+        has_events = False
+        has_budget = False
+        has_pfp = bool(_pfp_cache.get(str(user_id)))
+
+        # 1) Net worth + record snapshot
+        try:
+            resp = requests.get(f"{API_BASE}/plaid/accounts",
+                                 params={"user_id": user_id}, timeout=10)
+            if resp.ok:
+                accounts = resp.json().get("accounts", [])
+                if accounts:
+                    has_bank = True
+                    net_worth = sum((a.get("balances", {}).get("current") or 0) for a in accounts)
+                    nw_text  = f"${net_worth:,.2f}"
+                    nw_color = "#4ade80" if net_worth >= 0 else "#f87171"
+                    try:
+                        requests.post(f"{API_BASE}/balance/snapshot",
+                                       json={"user_id": user_id, "net_worth": net_worth}, timeout=6)
+                    except Exception:
+                        pass
+                else:
+                    nw_text, nw_color = "—", "#4b5563"
+            else:
+                nw_text, nw_color = "—", "#4b5563"
+        except Exception:
+            nw_text, nw_color = "—", "#4b5563"
+
+        def _up_nw():
+            card_labels["Net Worth"]["val"].configure(text=nw_text, text_color=nw_color)
+            card_labels["Net Worth"]["sub"].configure(
+                text="Across all accounts" if has_bank else "Connect a bank to start")
+        parent.after(0, _up_nw)
+
+        # 2) Balance history for chart
+        try:
+            resp = requests.get(f"{API_BASE}/balance/history",
+                                 params={"user_id": user_id, "days": 30}, timeout=10)
+            if resp.ok:
+                snapshots = resp.json().get("snapshots", [])
+                parent.after(0, lambda s=snapshots: draw_line_chart(s))
+        except Exception:
+            pass
+
+        # 3) Upcoming events (next 7 days)
+        try:
+            today = datetime.date.today()
+            week_end = today + datetime.timedelta(days=7)
+            all_events = []
+            resp = requests.get(f"{API_BASE}/calendar/events",
+                                 params={"user_id": user_id, "year": today.year, "month": today.month},
+                                 timeout=10)
+            if resp.ok:
+                all_events.extend(resp.json().get("events", []))
+            if week_end.month != today.month:
+                resp2 = requests.get(f"{API_BASE}/calendar/events",
+                                      params={"user_id": user_id, "year": week_end.year, "month": week_end.month},
+                                      timeout=10)
+                if resp2.ok:
+                    all_events.extend(resp2.json().get("events", []))
+
+            today_s = today.isoformat()
+            end_s   = week_end.isoformat()
+            upcoming = sorted(
+                [e for e in all_events if today_s <= e.get("event_date", "") <= end_s],
+                key=lambda e: (e.get("event_date", ""), e.get("event_time", ""))
+            )
+            has_events = len(upcoming) > 0
+
+            if upcoming:
+                nxt = upcoming[0]
+                try:
+                    ed = datetime.date.fromisoformat(nxt.get("event_date", ""))
+                    dl = "Today" if ed == today else ("Tomorrow" if ed == today + datetime.timedelta(days=1) else ed.strftime("%a %b %d"))
+                except Exception:
+                    dl = "Upcoming"
+                ev_card_text = dl
+            else:
+                ev_card_text = "Nothing soon"
+                nxt = None
+
+            def _up_ev():
+                card_labels["Next Event"]["val"].configure(
+                    text=ev_card_text, font=ctk.CTkFont(size=16, weight="bold"))
+                card_labels["Next Event"]["sub"].configure(
+                    text=nxt.get("title", "") if nxt else "Add events in Calendar")
+                render_upcoming_events(upcoming)
+            parent.after(0, _up_ev)
+        except Exception:
+            parent.after(0, lambda: render_upcoming_events([]))
+
+        # 4) Budget + transactions
+        try:
+            resp = requests.get(f"{API_BASE}/budget",
+                                 params={"user_id": user_id}, timeout=10)
+            budget = resp.json().get("budget") if resp.ok else None
+            if budget and budget.get("income", 0) > 0:
+                has_budget = True
+            txns = []
+            try:
+                resp2 = requests.get(f"{API_BASE}/plaid/transactions",
+                                      params={"user_id": user_id}, timeout=10)
+                if resp2.ok:
+                    txns = resp2.json().get("transactions", [])
+            except Exception:
+                pass
+            parent.after(0, lambda b=budget, t=txns: render_budget_progress(b, t))
+        except Exception:
+            parent.after(0, lambda: render_budget_progress(None, []))
+
+        # 5) Profile picture
+        if not has_pfp:
+            try:
+                resp = requests.get(f"{API_BASE}/profile/picture",
+                                     params={"user_id": user_id}, timeout=6)
+                if resp.ok and resp.json().get("image"):
+                    has_pfp = True
+            except Exception:
+                pass
+
+        # 6) Setup banner
+        incomplete = []
+        if not has_pfp:   incomplete.append(("profile picture", "Settings"))
+        if not has_bank:  incomplete.append(("bank account", "Financial"))
+        if not has_events: incomplete.append(("calendar events", "Calendar"))
+        if not has_budget: incomplete.append(("budget", "Budget"))
+
+        if incomplete:
+            hint, target = f"Finish setup: add {incomplete[0][0]}", incomplete[0][1]
+            def _show_banner():
+                banner_label.configure(text=hint)
+                banner_btn.configure(command=lambda t=target: switch_tab_fn(t) if switch_tab_fn else None)
+                setup_banner.place(x=440, y=20)
+            parent.after(0, _show_banner)
 
     def fetch_weather():
         try:
-            loc_resp = requests.get("http://ip-api.com/json/", timeout=6)
-            loc      = loc_resp.json()
-            lat      = loc.get("lat")
-            lon      = loc.get("lon")
-            city     = loc.get("city", "")
-            region   = loc.get("regionName", "")
-
-            w_resp = requests.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude":         lat,
-                    "longitude":        lon,
-                    "current":          "temperature_2m,weathercode,windspeed_10m,relativehumidity_2m",
-                    "daily":            "temperature_2m_max,temperature_2m_min",
-                    "temperature_unit": "fahrenheit",
-                    "windspeed_unit":   "mph",
-                    "forecast_days":    1,
-                    "timezone":         "auto",
-                },
-                timeout=6
-            )
-            w        = w_resp.json()
-            current  = w.get("current", {})
-            daily    = w.get("daily", {})
-
-            temp     = current.get("temperature_2m", "--")
-            code     = current.get("weathercode", 0)
-            wind     = current.get("windspeed_10m", "--")
-            humidity = current.get("relativehumidity_2m", "--")
-            hi       = daily.get("temperature_2m_max", [None])[0]
-            lo       = daily.get("temperature_2m_min", [None])[0]
-
+            loc = requests.get("http://ip-api.com/json/", timeout=6).json()
+            lat, lon = loc.get("lat"), loc.get("lon")
+            city, region = loc.get("city", ""), loc.get("regionName", "")
+            w = requests.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,weathercode,windspeed_10m,relativehumidity_2m",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "temperature_unit": "fahrenheit", "windspeed_unit": "mph",
+                "forecast_days": 1, "timezone": "auto",
+            }, timeout=6).json()
+            cur = w.get("current", {})
+            daily = w.get("daily", {})
+            temp = cur.get("temperature_2m", "--")
+            code = cur.get("weathercode", 0)
+            wind = cur.get("windspeed_10m", "--")
+            hum  = cur.get("relativehumidity_2m", "--")
+            hi   = daily.get("temperature_2m_max", [None])[0]
+            lo   = daily.get("temperature_2m_min", [None])[0]
             icon = WMO_ICONS.get(code, "🌡️")
-            desc_map = {
-                0:"Clear Sky", 1:"Mostly Clear", 2:"Partly Cloudy", 3:"Overcast",
-                45:"Foggy", 48:"Foggy", 51:"Light Drizzle", 53:"Drizzle",
-                55:"Heavy Drizzle", 61:"Light Rain", 63:"Rain", 65:"Heavy Rain",
-                71:"Light Snow", 73:"Snow", 75:"Heavy Snow",
-                80:"Showers", 81:"Heavy Showers", 82:"Violent Showers",
-                95:"Thunderstorm", 96:"Thunderstorm", 99:"Thunderstorm",
-            }
-            desc = desc_map.get(code, "Unknown")
-
-            def _update():
-                try:
-                    weather_icon.configure(text=icon)
-                    weather_temp.configure(text=f"{temp:.0f}°F")
-                    weather_desc.configure(text=desc)
-                    weather_city.configure(text=f"{city}, {region}")
-                    if hi and lo:
-                        weather_hi.configure(text=f"High {hi:.0f}°F  /  Low {lo:.0f}°F")
-                    weather_wind.configure(text=f"💨  Wind: {wind:.0f} mph")
-                    weather_humid.configure(text=f"💧  Humidity: {humidity}%")
-                except Exception as e:
-                    print(f"Update error: {e}")
-
-            parent.after(0, _update)
-
-        except Exception as e:
-            print(f"Weather error: {e}")
+            desc = WMO_DESCS.get(code, "Unknown")
+            def _up():
+                weather_icon.configure(text=icon)
+                weather_temp.configure(text=f"{temp:.0f}°F")
+                weather_desc.configure(text=desc)
+                weather_city.configure(text=f"{city}, {region}")
+                card_labels["Weather"]["val"].configure(text=f"{temp:.0f}°F")
+                card_labels["Weather"]["sub"].configure(text=f"{desc} — {city}")
+                if hi and lo:
+                    weather_details.configure(text=f"High {hi:.0f}°F  /  Low {lo:.0f}°F")
+                weather_extra.configure(text=f"💨 {wind:.0f} mph   💧 {hum}%")
+            parent.after(0, _up)
+        except Exception:
             parent.after(0, lambda: weather_desc.configure(text="Weather unavailable"))
 
+    threading.Thread(target=fetch_all_data, daemon=True).start()
     threading.Thread(target=fetch_weather, daemon=True).start()
 
 # =============================================================================
@@ -1956,7 +2271,6 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
     today        = datetime.date.today()
     state        = {"year": today.year, "month": today.month, "selected_date": None}
     events_cache = {}
-    notified     = set()
 
     user_id = ""
     if user_data:
@@ -2481,14 +2795,20 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
         if not parent.winfo_exists():
             return
         now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
         for date_str, events in list(events_cache.items()):
             for ev in events:
                 ev_id         = ev.get("id")
                 notify_before = ev.get("notify_before", "None")
-                if ev_id in notified or not notify_before or notify_before == "None":
+                # Track by (event_id, date) so recurring events notify on each day
+                notif_key = (ev_id, date_str)
+                if notif_key in _notified_events or not notify_before or notify_before == "None":
                     continue
                 ev_time = ev.get("event_time", "")
                 if not ev_time:
+                    continue
+                # Only check events happening today
+                if date_str != today_str:
                     continue
                 ev_dt = None
                 for fmt in ["%I:%M %p", "%H:%M", "%I:%M%p"]:
@@ -2502,7 +2822,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                 delta     = NOTIFY_DELTAS.get(notify_before, datetime.timedelta(0))
                 notify_at = ev_dt - delta
                 if notify_at <= now <= ev_dt:
-                    notified.add(ev_id)
+                    _notified_events.add(notif_key)
                     parent.after(0, lambda e=ev, nb=notify_before: show_notification_popup(e, nb))
         parent.after(60000, check_notifications)
 
