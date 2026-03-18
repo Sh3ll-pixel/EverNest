@@ -840,7 +840,6 @@ class CalendarEvent(db.Model):
 @app.route("/calendar/events", methods=["GET"])
 def get_calendar_events():
     import calendar as cal_mod
-    from dateutil.relativedelta import relativedelta
 
     user_id = request.args.get("user_id", "")
     year    = request.args.get("year",  type=int)
@@ -896,7 +895,7 @@ def get_calendar_events():
                     continue
 
             recurrence = getattr(ev, 'recurrence', None) or "None"
-            is_recurring = recurrence not in ("None", "", None)
+            is_recurring = recurrence not in ("None", "")
 
             if not is_recurring:
                 # One-time event — only include if it falls in the requested month
@@ -910,17 +909,25 @@ def get_calendar_events():
                 try:
                     base_date = datetime.date.fromisoformat(ev.event_date)
                 except (ValueError, TypeError):
+                    print(f"[RECUR] Bad date for event {ev.id}: {ev.event_date}")
                     continue
 
                 if not month_start:
                     raw_events.append((ev, ev.event_date, is_self))
                     continue
 
-                dates = _generate_recurrence_dates(
-                    base_date, recurrence, month_start, month_end
-                )
-                for d in dates:
-                    raw_events.append((ev, d.isoformat(), is_self))
+                try:
+                    dates = _generate_recurrence_dates(
+                        base_date, recurrence, month_start, month_end
+                    )
+                    print(f"[RECUR] Event '{ev.title}' ({recurrence}) base={ev.event_date} → {len(dates)} dates in {year}-{month:02d}")
+                    for d in dates:
+                        raw_events.append((ev, d.isoformat(), is_self))
+                except Exception as e:
+                    print(f"[RECUR] Error generating dates for event {ev.id}: {e}")
+                    # Fall back to showing on original date only
+                    if ev.event_date and ev.event_date.startswith(f"{year:04d}-{month:02d}"):
+                        raw_events.append((ev, ev.event_date, is_self))
 
     # Build response
     output = []
@@ -951,48 +958,68 @@ def get_calendar_events():
 
 
 def _generate_recurrence_dates(base_date, recurrence, month_start, month_end):
-    """Generate all occurrences of a recurring event within [month_start, month_end]."""
-    from dateutil.relativedelta import relativedelta
+    """Generate all occurrences of a recurring event within [month_start, month_end].
+    Uses only stdlib — no dateutil needed."""
     dates = []
     if not recurrence or recurrence == "None":
         return dates
 
-    increments = {
-        "Daily":    relativedelta(days=1),
-        "Weekly":   relativedelta(weeks=1),
-        "Bi-Weekly": relativedelta(weeks=2),
-        "Monthly":  relativedelta(months=1),
-        "Yearly":   relativedelta(years=1),
-    }
-    delta = increments.get(recurrence)
-    if not delta:
+    def add_days(d, n):
+        return d + datetime.timedelta(days=n)
+
+    def add_months(d, n):
+        """Add n months to date d, clamping day to valid range."""
+        m = d.month - 1 + n
+        y = d.year + m // 12
+        m = m % 12 + 1
+        import calendar as _cal
+        max_day = _cal.monthrange(y, m)[1]
+        return d.replace(year=y, month=m, day=min(d.day, max_day))
+
+    def add_years(d, n):
+        import calendar as _cal
+        try:
+            return d.replace(year=d.year + n)
+        except ValueError:
+            # Feb 29 on non-leap year
+            max_day = _cal.monthrange(d.year + n, d.month)[1]
+            return d.replace(year=d.year + n, day=min(d.day, max_day))
+
+    # Step function based on recurrence type
+    if recurrence == "Daily":
+        step = lambda d: add_days(d, 1)
+    elif recurrence == "Weekly":
+        step = lambda d: add_days(d, 7)
+    elif recurrence == "Bi-Weekly":
+        step = lambda d: add_days(d, 14)
+    elif recurrence == "Monthly":
+        step = lambda d: add_months(d, 1)
+    elif recurrence == "Yearly":
+        step = lambda d: add_years(d, 1)
+    else:
         return dates
 
-    # Walk forward from base_date
+    # Walk forward from base_date to reach the month window
     current = base_date
-    # If base_date is way before month_start, jump forward
-    if recurrence == "Daily":
-        if current < month_start:
-            diff = (month_start - current).days
-            current = current + relativedelta(days=diff)
-    elif recurrence == "Weekly":
-        while current < month_start:
-            current += delta
-    elif recurrence == "Bi-Weekly":
-        while current < month_start:
-            current += delta
-    elif recurrence == "Monthly":
-        while current < month_start:
-            current += delta
-    elif recurrence == "Yearly":
-        while current < month_start:
-            current += delta
 
-    # Generate all within range
-    while current <= month_end:
+    # Fast-forward for daily events to avoid thousands of iterations
+    if recurrence == "Daily" and current < month_start:
+        diff = (month_start - current).days
+        current = add_days(current, diff)
+    else:
+        # For weekly/monthly/yearly, step forward until we reach or pass month_start
+        safety = 0
+        while current < month_start and safety < 5000:
+            current = step(current)
+            safety += 1
+
+    # Generate all dates within the month range
+    safety = 0
+    while current <= month_end and safety < 500:
         if current >= month_start:
             dates.append(current)
-        current += delta
+        current = step(current)
+        safety += 1
 
     return dates
 
@@ -1043,6 +1070,22 @@ def delete_calendar_event(event_id):
         db.session.delete(ev)
         db.session.commit()
     return jsonify({"success": True})
+
+
+@app.route("/calendar/debug", methods=["GET"])
+def debug_calendar_events():
+    """Debug route — shows raw DB values for all events of a user."""
+    user_id = request.args.get("user_id", "")
+    events = CalendarEvent.query.filter_by(user_id=str(user_id)).all()
+    return jsonify({"events": [{
+        "id":            e.id,
+        "title":         e.title,
+        "event_date":    e.event_date,
+        "event_type":    e.event_type,
+        "recurrence":    getattr(e, 'recurrence', 'N/A'),
+        "color":         getattr(e, 'color', 'N/A'),
+        "family_shared": getattr(e, 'family_shared', 'N/A'),
+    } for e in events]})
 
 with app.app_context():
     db.create_all()
