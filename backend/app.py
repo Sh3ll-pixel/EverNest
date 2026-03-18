@@ -873,82 +873,58 @@ def get_calendar_events():
         month_start = None
         month_end   = None
 
-    # Fetch events for all members
+    # Fetch ALL events for relevant users, then sort in Python
     raw_events = []
-    for uid in member_ids:
+
+    query_uids = member_ids if member_ids else []
+    if not query_uids:
+        query_uids = [user_id]
+
+    for uid in query_uids:
         is_self = (str(uid) == str(user_id))
-        # One-time events for this month
-        query = CalendarEvent.query.filter_by(user_id=str(uid))
-        if month_start:
-            prefix = f"{year:04d}-{month:02d}"
-            one_time = query.filter(
-                CalendarEvent.event_date.like(f"{prefix}%"),
-                CalendarEvent.recurrence.in_(["None", "", None])
-            ).all()
-        else:
-            one_time = query.filter(CalendarEvent.recurrence.in_(["None", "", None])).all()
+        all_user_events = CalendarEvent.query.filter_by(user_id=str(uid)).all()
 
-        # All recurring events (started on or before month_end)
-        recurring = query.filter(
-            CalendarEvent.recurrence.notin_(["None", "", None]) if db.session.bind else
-            ~CalendarEvent.recurrence.in_(["None", "", None])
-        ).all()
+        for ev in all_user_events:
+            # Respect family_shared — skip private events from other users
+            if not is_self:
+                try:
+                    shared = ev.family_shared
+                except AttributeError:
+                    shared = True
+                # Explicitly treat False as private, anything else as shared
+                if shared is False or shared == 0:
+                    continue
 
-        for ev in one_time:
-            if not is_self and not getattr(ev, 'family_shared', True):
-                continue
-            raw_events.append((ev, ev.event_date, is_self))
+            recurrence = getattr(ev, 'recurrence', None) or "None"
+            is_recurring = recurrence not in ("None", "", None)
 
-        # Generate recurring instances within the month
-        for ev in recurring:
-            if not is_self and not getattr(ev, 'family_shared', True):
-                continue
-            try:
-                base_date = datetime.date.fromisoformat(ev.event_date)
-            except (ValueError, TypeError):
-                continue
-            if not month_start:
-                raw_events.append((ev, ev.event_date, is_self))
-                continue
-
-            dates = _generate_recurrence_dates(
-                base_date, ev.recurrence, month_start, month_end
-            )
-            for d in dates:
-                raw_events.append((ev, d.isoformat(), is_self))
-
-    # Fallback for string user_id with no family
-    if not member_ids:
-        query = CalendarEvent.query.filter_by(user_id=str(user_id))
-        if month_start:
-            prefix = f"{year:04d}-{month:02d}"
-            one_time = query.filter(
-                CalendarEvent.event_date.like(f"{prefix}%"),
-                CalendarEvent.recurrence.in_(["None", "", None])
-            ).all()
-            recurring = query.filter(
-                ~CalendarEvent.recurrence.in_(["None", "", None])
-            ).all()
-            for ev in one_time:
-                raw_events.append((ev, ev.event_date, True))
-            for ev in recurring:
+            if not is_recurring:
+                # One-time event — only include if it falls in the requested month
+                if month_start:
+                    if ev.event_date and ev.event_date.startswith(f"{year:04d}-{month:02d}"):
+                        raw_events.append((ev, ev.event_date, is_self))
+                else:
+                    raw_events.append((ev, ev.event_date, is_self))
+            else:
+                # Recurring event — generate instances for this month
                 try:
                     base_date = datetime.date.fromisoformat(ev.event_date)
                 except (ValueError, TypeError):
                     continue
+
+                if not month_start:
+                    raw_events.append((ev, ev.event_date, is_self))
+                    continue
+
                 dates = _generate_recurrence_dates(
-                    base_date, ev.recurrence, month_start, month_end
+                    base_date, recurrence, month_start, month_end
                 )
                 for d in dates:
-                    raw_events.append((ev, d.isoformat(), True))
-        else:
-            for ev in query.all():
-                raw_events.append((ev, ev.event_date, True))
+                    raw_events.append((ev, d.isoformat(), is_self))
 
     # Build response
     output = []
     for ev, date_str, is_self in raw_events:
-        # Use custom color if set, otherwise fall back to member color or type default
         ev_color = getattr(ev, 'color', '') or ''
         if not ev_color and ev.user_id.isdigit():
             ev_color = color_map.get(int(ev.user_id), "#96abff")
@@ -966,11 +942,10 @@ def get_calendar_events():
             "created_by":    ev.user_id,
             "color":         ev_color,
             "recurrence":    getattr(ev, 'recurrence', 'None') or "None",
-            "family_shared": getattr(ev, 'family_shared', True),
+            "family_shared": getattr(ev, 'family_shared', True) if getattr(ev, 'family_shared', None) is not None else True,
             "is_mine":       is_self,
         })
 
-    # Sort by date then time
     output.sort(key=lambda x: (x["event_date"], x.get("event_time") or ""))
     return jsonify({"events": output})
 
