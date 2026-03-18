@@ -24,9 +24,22 @@ CORS(app)
 
 
 # ── App config ────────────────────────────────────────────────────────────────
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///users.db")
+database_url = os.environ.get("DATABASE_URL", "sqlite:///users.db")
+# Render uses postgres:// but SQLAlchemy needs postgresql://
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-this")
+
+# Fix stale/dropped connections (SSL error: decryption failed or bad record mac)
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,        # Test connections before using them
+    "pool_recycle": 300,           # Recycle connections every 5 minutes
+    "pool_size": 5,
+    "max_overflow": 10,
+}
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
@@ -42,6 +55,7 @@ class User(db.Model):
     subscription_end       = db.Column(db.DateTime, nullable=True)
     stripe_customer_id     = db.Column(db.String(100), nullable=True)
     paypal_subscription_id = db.Column(db.String(100), nullable=True)
+    profile_picture        = db.Column(db.Text, nullable=True)  # base64 JPEG, max ~200KB
 
 
 def find_user_by_id(user_id):
@@ -585,11 +599,12 @@ def get_family_info():
         if u:
             fm = FamilyMember.query.filter_by(family_id=family.id, user_id=uid).first()
             members_data.append({
-                "user_id":  uid,
-                "username": u.username,
-                "email":    u.email,
-                "color":    fm.color if fm else colors[i % len(colors)],
-                "is_me":    uid == user_id,
+                "user_id":         uid,
+                "username":        u.username,
+                "email":           u.email,
+                "color":           fm.color if fm else colors[i % len(colors)],
+                "is_me":           uid == user_id,
+                "profile_picture": u.profile_picture or None,
             })
  
     # Pending outgoing invites
@@ -1093,6 +1108,55 @@ def delete_account():
     db.session.delete(user)
     db.session.commit()
     return jsonify({"success": True})
+
+
+# =============================================================================
+#  PROFILE PICTURE
+# =============================================================================
+
+@app.route("/profile/upload_picture", methods=["POST"])
+def upload_profile_picture():
+    """Accept a base64-encoded JPEG image (max ~200 KB encoded)."""
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    image   = data.get("image", "")
+
+    user = find_user_by_id(user_id)
+    if not user:
+        return jsonify({"success": False, "message": "User not found"}), 404
+
+    # Sanity-check size (~200 KB base64 ≈ 270 000 chars)
+    if len(image) > 300_000:
+        return jsonify({"success": False, "message": "Image too large. Max ~200 KB."}), 400
+
+    user.profile_picture = image
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/profile/picture", methods=["GET"])
+def get_profile_picture():
+    user_id = request.args.get("user_id", "")
+    user = find_user_by_id(user_id)
+    if not user or not user.profile_picture:
+        return jsonify({"image": None})
+    return jsonify({"image": user.profile_picture})
+
+
+@app.route("/profile/pictures", methods=["GET"])
+def get_profile_pictures_bulk():
+    """Return profile pictures for multiple user_ids at once (for family view)."""
+    ids_raw = request.args.get("user_ids", "")
+    if not ids_raw:
+        return jsonify({"pictures": {}})
+
+    user_ids = [uid.strip() for uid in ids_raw.split(",") if uid.strip()]
+    result = {}
+    for uid in user_ids:
+        user = find_user_by_id(uid)
+        if user and user.profile_picture:
+            result[str(user.id)] = user.profile_picture
+    return jsonify({"pictures": result})
  
  
 @app.route("/subscription/cancel", methods=["POST"])
@@ -1293,8 +1357,24 @@ def migrate_subscription():
             conn.execute(db.text(
                 "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS paypal_subscription_id VARCHAR(100)"
             ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS profile_picture TEXT"
+            ))
             conn.commit()
-        return "Subscription migration successful", 200
+        return "Migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
+
+@app.route("/migrate_profile_picture")
+def migrate_profile_picture():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS profile_picture TEXT"
+            ))
+            conn.commit()
+        return "Profile picture migration successful", 200
     except Exception as e:
         return str(e), 400
 
