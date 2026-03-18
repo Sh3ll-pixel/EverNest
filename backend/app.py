@@ -84,13 +84,32 @@ def subscription_status():
     ).first()
     if not user:
         return jsonify({"subscribed": False}), 404
- 
+
     # Check if subscription_end has passed
     if user.is_subscribed and user.subscription_end:
         if datetime.datetime.utcnow() > user.subscription_end:
             user.is_subscribed = False
             db.session.commit()
- 
+
+    # If DB says not subscribed but user has a Stripe customer,
+    # check Stripe directly — covers cases where webhook/success page failed
+    if not user.is_subscribed and user.stripe_customer_id:
+        try:
+            subs = stripe.Subscription.list(
+                customer=user.stripe_customer_id,
+                status="active",
+                limit=1
+            )
+            if subs.data:
+                active_sub = subs.data[0]
+                user.is_subscribed = True
+                user.subscription_end = datetime.datetime.utcfromtimestamp(
+                    active_sub.current_period_end
+                )
+                db.session.commit()
+        except Exception as e:
+            print(f"Stripe check failed for user {user_id}: {e}")
+
     return jsonify({
         "subscribed":        user.is_subscribed or False,
         "subscription_end":  user.subscription_end.isoformat() if user.subscription_end else None,
