@@ -1,2 +1,10 @@
-customtkinter
-pillow
+flask
+flask-sqlalchemy
+flask-bcrypt
+flask-cors
+gunicorn
+psycopg2-binary
+stripe
+plaid-python
+requests
+python-dateutil
