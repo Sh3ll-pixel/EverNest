@@ -1937,6 +1937,20 @@ TYPE_COLORS = {
     "Other":       "#7B93DB",
 }
 
+EVENT_COLORS = [
+    ("#5B8DEF", "Blue"),
+    ("#FF6B6B", "Red"),
+    ("#4CFF7A", "Green"),
+    ("#FFD700", "Gold"),
+    ("#C084FC", "Purple"),
+    ("#FF9F40", "Orange"),
+    ("#7B93DB", "Lavender"),
+    ("#38bdf8", "Sky"),
+    ("#fb7185", "Pink"),
+]
+
+RECURRENCE_OPTIONS = ["None", "Daily", "Weekly", "Bi-Weekly", "Monthly", "Yearly"]
+
 
 def render_calendar_tab(parent, user_data=None, app_window=None):
     today        = datetime.date.today()
@@ -1974,13 +1988,13 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
     add_btn = ctk.CTkButton(parent, text="＋  Add Event", width=140, height=32,
                              fg_color="#3b5bdb", hover_color="#2b4bc8",
                              text_color="#f0f1f3", corner_radius=8,
-                             command=lambda: open_add_event_dialog(state["selected_date"] or today))
+                             command=lambda: open_event_dialog(state["selected_date"] or today))
     add_btn.place(x=710, y=20)
 
     # Day-of-week headers
     DAYS   = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     CELL_W = 76
-    CELL_H = 76
+    CELL_H = 84
     GRID_X = 30
     GRID_Y = 62
 
@@ -2007,9 +2021,13 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
     side_scroll = ctk.CTkScrollableFrame(side_panel, fg_color="transparent", width=250, height=460)
     side_scroll.pack(fill="both", expand=True, padx=6, pady=4)
 
-    def get_color(event_type):
-        return TYPE_COLORS.get(event_type, "#7B93DB")
+    def get_event_color(ev):
+        c = ev.get("color", "")
+        if c:
+            return c
+        return TYPE_COLORS.get(ev.get("event_type", "Other"), "#7B93DB")
 
+    # ── Grid rendering with event bars ────────────────────────────────────────
     def render_grid():
         for w in grid_frame.winfo_children():
             w.destroy()
@@ -2052,15 +2070,32 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                                         width=22, height=22, corner_radius=11)
                 num_lbl.place(x=5, y=4)
 
-                # Event dots
+                # Event bars instead of dots
                 day_events = events_cache.get(date_str, [])
-                dot_x = 5
-                for ev in day_events[:5]:
-                    color = get_color(ev.get("event_type", "Other"))
-                    dot = ctk.CTkFrame(cell, fg_color=color, width=7, height=7, corner_radius=4)
-                    dot.place(x=dot_x, y=CELL_H - 14)
-                    dot_x += 10
-                    dot.bind("<Button-1>", lambda e, d=date_obj: on_click(d))
+                bar_y = 28
+                for ev in day_events[:3]:
+                    color = get_event_color(ev)
+                    bar = ctk.CTkFrame(cell, fg_color=color,
+                                        width=CELL_W - 10, height=14, corner_radius=3)
+                    bar.place(x=3, y=bar_y)
+                    # Show truncated title on bar
+                    title_text = ev.get("title", "")
+                    if len(title_text) > 8:
+                        title_text = title_text[:7] + "…"
+                    ctk.CTkLabel(bar, text=title_text, fg_color="transparent",
+                                  text_color="#000000",
+                                  font=ctk.CTkFont(size=8, weight="bold"),
+                                  width=CELL_W - 14, height=14, anchor="w"
+                                  ).place(x=2, y=0)
+                    bar.bind("<Button-1>", lambda e, d=date_obj: on_click(d))
+                    bar_y += 16
+
+                # Overflow indicator
+                if len(day_events) > 3:
+                    ctk.CTkLabel(cell, text=f"+{len(day_events) - 3} more",
+                                  fg_color="transparent", text_color="#4b5060",
+                                  font=ctk.CTkFont(size=8),
+                                  width=CELL_W - 10, height=10).place(x=5, y=bar_y)
 
                 def on_click(d=date_obj):
                     state["selected_date"] = d
@@ -2071,6 +2106,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                     widget.bind("<Button-1>", lambda e, d=date_obj: on_click(d))
                     widget.configure(cursor="hand2")
 
+    # ── Side panel event list ─────────────────────────────────────────────────
     def show_day_events(date_obj):
         for w in side_scroll.winfo_children():
             w.destroy()
@@ -2085,7 +2121,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                           font=ctk.CTkFont(size=13)).pack(anchor="w", padx=8, pady=10)
         else:
             for ev in events:
-                color = get_color(ev.get("event_type", "Other"))
+                color = get_event_color(ev)
                 card  = ctk.CTkFrame(side_scroll, fg_color="#363C45", corner_radius=8)
                 card.pack(fill="x", pady=4, padx=2)
 
@@ -2098,6 +2134,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                               text_color="#d1d5db", font=ctk.CTkFont(size=13, weight="bold"),
                               anchor="w").pack(fill="x")
 
+                # Type badge with color
                 ctk.CTkLabel(info, text=f"  {ev.get('event_type', 'Other')}  ",
                               fg_color=color, text_color="#000000",
                               font=ctk.CTkFont(size=10, weight="bold"),
@@ -2113,25 +2150,54 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                                   text_color="#666B75", font=ctk.CTkFont(size=11),
                                   wraplength=210, anchor="w").pack(fill="x")
 
+                # Recurrence badge
+                rec = ev.get("recurrence", "None")
+                if rec and rec != "None":
+                    ctk.CTkLabel(info, text=f"🔁  {rec}",
+                                  fg_color="transparent", text_color="#8b9cf7",
+                                  font=ctk.CTkFont(size=10)).pack(anchor="w")
+
+                # Shared badge
+                if not ev.get("family_shared", True):
+                    ctk.CTkLabel(info, text="🔒  Private",
+                                  fg_color="transparent", text_color="#6b7280",
+                                  font=ctk.CTkFont(size=10)).pack(anchor="w")
+
                 notif = ev.get("notify_before", "None")
                 if notif and notif != "None":
                     ctk.CTkLabel(info, text=f"🔔  {notif} before",
                                   fg_color="transparent", text_color="#FFD700",
                                   font=ctk.CTkFont(size=11)).pack(anchor="w")
 
+                # Action buttons row
+                btn_row = ctk.CTkFrame(card, fg_color="transparent")
+                btn_row.pack(fill="x", padx=8, pady=(2, 6))
+
+                is_mine = ev.get("is_mine", True)
                 ev_id = ev.get("id")
-                ctk.CTkButton(card, text="✕ Delete", width=70, height=20,
-                               fg_color="transparent", hover_color="#2a1520",
-                               text_color="#ff6b6b", corner_radius=4,
-                               font=ctk.CTkFont(size=11),
-                               command=lambda eid=ev_id, d=date_obj: delete_event(eid, d)
-                               ).pack(anchor="e", padx=8, pady=(0, 6))
+
+                if is_mine:
+                    ctk.CTkButton(btn_row, text="✎ Edit", width=60, height=20,
+                                   fg_color="transparent", hover_color="#1e2a42",
+                                   text_color="#5B8DEF", corner_radius=4,
+                                   font=ctk.CTkFont(size=11),
+                                   command=lambda eid=ev_id, e=ev, d=date_obj:
+                                       open_event_dialog(d, edit_event=e)
+                                   ).pack(side="left")
+
+                    ctk.CTkButton(btn_row, text="✕ Delete", width=70, height=20,
+                                   fg_color="transparent", hover_color="#2a1520",
+                                   text_color="#ff6b6b", corner_radius=4,
+                                   font=ctk.CTkFont(size=11),
+                                   command=lambda eid=ev_id, d=date_obj: delete_event(eid, d)
+                                   ).pack(side="right")
 
         ctk.CTkButton(side_scroll, text="＋  Add Event for this day",
                        fg_color="#3b5bdb", hover_color="#2b4bc8",
                        width=230, height=30, text_color="#f0f1f3", corner_radius=8,
-                       command=lambda: open_add_event_dialog(date_obj)).pack(pady=(10, 4))
+                       command=lambda: open_event_dialog(date_obj)).pack(pady=(10, 4))
 
+    # ── Load events ───────────────────────────────────────────────────────────
     def load_events():
         status_var.set("Loading…")
         def _do():
@@ -2171,17 +2237,19 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
         state["year"]  = y
         load_events()
 
-    def open_add_event_dialog(date_obj):
+    # ── Add / Edit event dialog ───────────────────────────────────────────────
+    def open_event_dialog(date_obj, edit_event=None):
+        is_edit = edit_event is not None
         dialog = ctk.CTkToplevel(parent)
         dialog.configure(fg_color="#13161b")
-        dialog.title("Add Event")
+        dialog.title("Edit Event" if is_edit else "Add Event")
         dialog.resizable(False, False)
         dialog.grab_set()
         dialog.lift()
         dialog.attributes("-topmost", True)
         dialog.after(200, lambda: dialog.attributes("-topmost", False))
 
-        dw, dh = 360, 480
+        dw, dh = 380, 620
         parent.update_idletasks()
         px = parent.winfo_rootx()
         py = parent.winfo_rooty()
@@ -2189,60 +2257,145 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
         ph = parent.winfo_height()
         dialog.geometry(f"{dw}x{dh}+{px + pw//2 - dw//2}+{py + ph//2 - dh//2}")
 
-        ctk.CTkLabel(dialog, text="Add Event", fg_color="transparent",
-                      text_color="#7B93DB", font=ctk.CTkFont(size=18, weight="bold")).place(x=20, y=16)
-        ctk.CTkLabel(dialog, text=date_obj.strftime("%B %d, %Y"), fg_color="transparent",
-                      text_color="#5B8DEF", font=ctk.CTkFont(size=13)).place(x=20, y=44)
+        # ── Scrollable form ───────────────────────────────────────────────────
+        form = ctk.CTkScrollableFrame(dialog, fg_color="transparent", width=350, height=560)
+        form.place(x=8, y=8)
 
-        ctk.CTkLabel(dialog, text="Title *", fg_color="transparent",
-                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)).place(x=20, y=78)
-        title_entry = ctk.CTkEntry(dialog, placeholder_text="Event title",
+        ctk.CTkLabel(form, text="Edit Event" if is_edit else "Add Event",
+                      fg_color="transparent",
+                      text_color="#7B93DB", font=ctk.CTkFont(size=18, weight="bold")
+                      ).pack(anchor="w", padx=12, pady=(8, 0))
+        ctk.CTkLabel(form, text=date_obj.strftime("%B %d, %Y"), fg_color="transparent",
+                      text_color="#5B8DEF", font=ctk.CTkFont(size=13)
+                      ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Title
+        ctk.CTkLabel(form, text="Title *", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        title_entry = ctk.CTkEntry(form, placeholder_text="Event title",
                                     fg_color="#1f2328", width=318, height=36,
                                     text_color="#7B93DB", corner_radius=8,
                                     border_width=1, border_color="#2a2f38")
-        title_entry.place(x=20, y=96)
+        title_entry.pack(padx=12, pady=(0, 8))
+        if is_edit:
+            title_entry.insert(0, edit_event.get("title", ""))
 
-        ctk.CTkLabel(dialog, text="Type", fg_color="transparent",
-                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)).place(x=20, y=142)
-        type_var  = ctk.StringVar(value="Appointment")
+        # Type
+        ctk.CTkLabel(form, text="Type", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        type_var  = ctk.StringVar(value=edit_event.get("event_type", "Appointment") if is_edit else "Appointment")
         type_menu = ctk.CTkOptionMenu(
-            dialog, values=["Appointment", "Bill", "Meeting", "Reminder", "Other"],
+            form, values=["Appointment", "Bill", "Meeting", "Reminder", "Other"],
             variable=type_var, fg_color="#1f2328", width=318, height=36,
             text_color="#7B93DB", button_color="#2a2f38",
             button_hover_color="#2b4bc8", corner_radius=8
         )
-        type_menu.place(x=20, y=160)
+        type_menu.pack(padx=12, pady=(0, 8))
 
-        ctk.CTkLabel(dialog, text="Time (optional)", fg_color="transparent",
-                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)).place(x=20, y=206)
-        time_entry = ctk.CTkEntry(dialog, placeholder_text="e.g. 2:30 PM",
+        # Color picker
+        ctk.CTkLabel(form, text="Event Color", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+
+        color_frame = ctk.CTkFrame(form, fg_color="transparent", height=36)
+        color_frame.pack(fill="x", padx=12, pady=(0, 8))
+        color_var = {"value": edit_event.get("color", "") if is_edit else ""}
+        color_btns = []
+
+        def set_color(hex_color):
+            color_var["value"] = hex_color
+            for btn, c in color_btns:
+                btn.configure(border_width=3 if c == hex_color else 0,
+                              border_color="#ffffff" if c == hex_color else "transparent")
+
+        for hex_c, name in EVENT_COLORS:
+            btn = ctk.CTkButton(color_frame, text="", width=28, height=28,
+                                 fg_color=hex_c, hover_color=hex_c,
+                                 corner_radius=14, border_width=0,
+                                 command=lambda c=hex_c: set_color(c))
+            btn.pack(side="left", padx=2)
+            color_btns.append((btn, hex_c))
+
+        # Auto-fill color (use type default)
+        ctk.CTkButton(color_frame, text="Auto", width=40, height=28,
+                       fg_color="#1f2328", hover_color="#2a2f38",
+                       text_color="#7B93DB", corner_radius=8,
+                       font=ctk.CTkFont(size=10),
+                       command=lambda: set_color("")
+                       ).pack(side="left", padx=(6, 0))
+
+        if color_var["value"]:
+            set_color(color_var["value"])
+
+        # Time
+        ctk.CTkLabel(form, text="Time (optional)", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        time_entry = ctk.CTkEntry(form, placeholder_text="e.g. 2:30 PM",
                                    fg_color="#1f2328", width=318, height=36,
                                    text_color="#7B93DB", corner_radius=8,
                                    border_width=1, border_color="#2a2f38")
-        time_entry.place(x=20, y=224)
+        time_entry.pack(padx=12, pady=(0, 8))
+        if is_edit and edit_event.get("event_time"):
+            time_entry.insert(0, edit_event["event_time"])
 
-        ctk.CTkLabel(dialog, text="Notify Before", fg_color="transparent",
-                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)).place(x=20, y=270)
-        notify_var  = ctk.StringVar(value="None")
+        # Recurrence
+        ctk.CTkLabel(form, text="Recurrence", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        recur_var = ctk.StringVar(value=edit_event.get("recurrence", "None") if is_edit else "None")
+        recur_menu = ctk.CTkOptionMenu(
+            form, values=RECURRENCE_OPTIONS,
+            variable=recur_var, fg_color="#1f2328", width=318, height=36,
+            text_color="#7B93DB", button_color="#2a2f38",
+            button_hover_color="#2b4bc8", corner_radius=8
+        )
+        recur_menu.pack(padx=12, pady=(0, 8))
+
+        # Notify Before
+        ctk.CTkLabel(form, text="Notify Before", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        notify_var  = ctk.StringVar(value=edit_event.get("notify_before", "None") if is_edit else "None")
         notify_menu = ctk.CTkOptionMenu(
-            dialog, values=["None", "5 minutes", "15 minutes", "30 minutes", "1 hour", "1 day"],
+            form, values=["None", "5 minutes", "15 minutes", "30 minutes", "1 hour", "1 day"],
             variable=notify_var, fg_color="#1f2328", width=318, height=36,
             text_color="#7B93DB", button_color="#2a2f38",
             button_hover_color="#2b4bc8", corner_radius=8
         )
-        notify_menu.place(x=20, y=288)
+        notify_menu.pack(padx=12, pady=(0, 8))
 
-        ctk.CTkLabel(dialog, text="Note (optional)", fg_color="transparent",
-                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)).place(x=20, y=334)
-        note_entry = ctk.CTkEntry(dialog, placeholder_text="Optional note",
+        # Note
+        ctk.CTkLabel(form, text="Note (optional)", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        note_entry = ctk.CTkEntry(form, placeholder_text="Optional note",
                                    fg_color="#1f2328", width=318, height=36,
                                    text_color="#7B93DB", corner_radius=8,
                                    border_width=1, border_color="#2a2f38")
-        note_entry.place(x=20, y=352)
+        note_entry.pack(padx=12, pady=(0, 8))
+        if is_edit and edit_event.get("note"):
+            note_entry.insert(0, edit_event["note"])
 
-        err_label = ctk.CTkLabel(dialog, text="", fg_color="transparent",
+        # Family shared toggle
+        ctk.CTkLabel(form, text="Visibility", fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12)
+                      ).pack(anchor="w", padx=12)
+        shared_var = ctk.BooleanVar(
+            value=edit_event.get("family_shared", True) if is_edit else True
+        )
+        ctk.CTkSwitch(form, text="Share with family",
+                        variable=shared_var, fg_color="#363C45",
+                        progress_color="#3b5bdb",
+                        font=ctk.CTkFont(size=12), text_color="#9A9A9A"
+                        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Error / status
+        err_label = ctk.CTkLabel(form, text="", fg_color="transparent",
                                   text_color="#ff6b6b", font=ctk.CTkFont(size=11))
-        err_label.place(x=20, y=406)
+        err_label.pack(anchor="w", padx=12)
 
         def submit():
             title = title_entry.get().strip()
@@ -2257,10 +2410,22 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                 "event_time":    time_entry.get().strip(),
                 "notify_before": notify_var.get(),
                 "note":          note_entry.get().strip(),
+                "color":         color_var["value"],
+                "recurrence":    recur_var.get(),
+                "family_shared": shared_var.get(),
             }
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/calendar/events", json=payload, timeout=10)
+                    if is_edit:
+                        resp = requests.put(
+                            f"{API_BASE}/calendar/events/{edit_event['id']}",
+                            json=payload, timeout=10
+                        )
+                    else:
+                        resp = requests.post(
+                            f"{API_BASE}/calendar/events",
+                            json=payload, timeout=10
+                        )
                     if resp.ok:
                         parent.after(0, lambda: [dialog.destroy(), load_events()])
                     else:
@@ -2269,10 +2434,11 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
                     parent.after(0, lambda: err_label.configure(text=f"Error: {e}"))
             threading.Thread(target=_do, daemon=True).start()
 
-        ctk.CTkButton(dialog, text="Save Event", command=submit,
+        ctk.CTkButton(form, text="Save Changes" if is_edit else "Save Event",
+                       command=submit,
                        fg_color="#3b5bdb", hover_color="#2b4bc8",
-                       width=150, height=36, text_color="#f0f1f3", corner_radius=8
-                       ).place(x=105, y=430)
+                       width=318, height=36, text_color="#f0f1f3", corner_radius=8
+                       ).pack(padx=12, pady=(4, 12))
 
     def delete_event(event_id, date_obj):
         def _do():
@@ -2332,7 +2498,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
         sh = popup.winfo_screenheight()
         popup.geometry(f"{pw}x{ph}+{sw - pw - 20}+{sh - ph - 60}")
 
-        color = get_color(ev.get("event_type", "Other"))
+        color = get_event_color(ev)
         ctk.CTkFrame(popup, fg_color=color, width=330, height=4, corner_radius=0).place(x=0, y=0)
         ctk.CTkLabel(popup, text=f"🔔  {notify_before} before", fg_color="transparent",
                       text_color="#FFD700", font=ctk.CTkFont(size=11)).place(x=16, y=14)
