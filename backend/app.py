@@ -498,6 +498,17 @@ class Budget(db.Model):
     categories  = db.Column(db.Text, default="{}")   # JSON string
     bills       = db.Column(db.Text, default="[]")   # JSON string
 
+
+# ==============================================================================
+# Balance Snapshot Model (for net worth over time chart)
+# ==============================================================================
+class BalanceSnapshot(db.Model):
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.String(80), nullable=False)
+    date       = db.Column(db.String(10), nullable=False)   # YYYY-MM-DD
+    net_worth  = db.Column(db.Float, default=0)
+    __table_args__ = (db.UniqueConstraint('user_id', 'date', name='uq_user_date'),)
+
 # =============================================================================
 # Family Models
 # =============================================================================
@@ -814,6 +825,46 @@ def save_budget_route():
 
     db.session.commit()
     return jsonify({"success": True}), 201
+
+
+# ==============================================================================
+# Balance Snapshot Routes
+# ==============================================================================
+
+@app.route("/balance/snapshot", methods=["POST"])
+def record_balance_snapshot():
+    """Record today's net worth for a user. Called from the dashboard on load."""
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    net_worth = float(data.get("net_worth", 0))
+    today_str = datetime.date.today().isoformat()
+
+    # Upsert — update if already exists for today, else insert
+    existing = BalanceSnapshot.query.filter_by(user_id=user_id, date=today_str).first()
+    if existing:
+        existing.net_worth = net_worth
+    else:
+        snap = BalanceSnapshot(user_id=user_id, date=today_str, net_worth=net_worth)
+        db.session.add(snap)
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/balance/history", methods=["GET"])
+def get_balance_history():
+    """Return the last 30 days of net worth snapshots."""
+    user_id = request.args.get("user_id", "")
+    days    = request.args.get("days", 30, type=int)
+
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    snapshots = BalanceSnapshot.query.filter(
+        BalanceSnapshot.user_id == user_id,
+        BalanceSnapshot.date >= cutoff
+    ).order_by(BalanceSnapshot.date).all()
+
+    return jsonify({"snapshots": [
+        {"date": s.date, "net_worth": s.net_worth} for s in snapshots
+    ]})
 
 
 # ── Calendar Integration ──────────────────────────────────────────────────────
@@ -1565,6 +1616,25 @@ def migrate_calendar():
             ))
             conn.commit()
         return "Calendar migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
+
+@app.route("/migrate_balance")
+def migrate_balance():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text("""
+                CREATE TABLE IF NOT EXISTS balance_snapshot (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(80) NOT NULL,
+                    date VARCHAR(10) NOT NULL,
+                    net_worth FLOAT DEFAULT 0,
+                    UNIQUE(user_id, date)
+                )
+            """))
+            conn.commit()
+        return "Balance snapshot migration successful", 200
     except Exception as e:
         return str(e), 400
 
