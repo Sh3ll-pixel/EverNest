@@ -10,6 +10,7 @@ from plaid.api import plaid_api
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
+from plaid.model.item_remove_request import ItemRemoveRequest
 from plaid.model.accounts_get_request import AccountsGetRequest
 from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
 from plaid.model.transactions_get_request import TransactionsGetRequest
@@ -1323,7 +1324,20 @@ def remove_bank():
     user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
-    user.plaid_access_token = None
+
+    # Call Plaid /item/remove to deactivate the Item and stop billing
+    if user.plaid_access_token and plaid_client:
+        try:
+            req = ItemRemoveRequest(access_token=user.plaid_access_token)
+            plaid_client.item_remove(req)
+            print(f"[PLAID] Removed Item for user {user_id}")
+        except Exception as e:
+            print(f"[PLAID] Failed to remove Item (may already be removed): {e}")
+
+    user.plaid_access_token    = None
+    user.plaid_item_id         = None
+    user.plaid_reauth_required = False
+    user.plaid_new_accounts    = False
     db.session.commit()
     return jsonify({"success": True})
  
@@ -1343,14 +1357,24 @@ def delete_account():
     user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
- 
+
+    # Call Plaid /item/remove to deactivate the Item on user offboarding
+    if user.plaid_access_token and plaid_client:
+        try:
+            req = ItemRemoveRequest(access_token=user.plaid_access_token)
+            plaid_client.item_remove(req)
+            print(f"[PLAID] Removed Item for deleted user {user_id}")
+        except Exception as e:
+            print(f"[PLAID] Failed to remove Item on account deletion: {e}")
+
     # Delete all related data
     CalendarEvent.query.filter_by(user_id=str(user.id)).delete()
     CalendarEvent.query.filter_by(user_id=user.username).delete()
     Note.query.filter_by(user_id=str(user.id)).delete()
     Budget.query.filter_by(user_id=str(user.id)).delete()
+    BalanceSnapshot.query.filter_by(user_id=str(user.id)).delete()
     FamilyMember.query.filter_by(user_id=user.id).delete()
- 
+
     db.session.delete(user)
     db.session.commit()
     return jsonify({"success": True})
