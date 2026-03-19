@@ -8,3 +8,4 @@ stripe
 plaid-python
 requests
 python-dateutil
+PyJWT>=2.8.0
