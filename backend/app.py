@@ -55,7 +55,8 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     plaid_access_token = db.Column(db.String(255), nullable=True)
     plaid_item_id      = db.Column(db.String(255), nullable=True)
-    plaid_reauth_required = db.Column(db.Boolean, default=False)
+    plaid_reauth_required     = db.Column(db.Boolean, default=False)
+    plaid_new_accounts        = db.Column(db.Boolean, default=False)
     is_subscribed          = db.Column(db.Boolean, default=False)
     subscription_end       = db.Column(db.DateTime, nullable=True)
     stripe_customer_id     = db.Column(db.String(100), nullable=True)
@@ -1686,16 +1687,63 @@ def plaid_reauth_complete():
     return jsonify({"success": True})
 
 
+@app.route("/plaid/new_accounts_link_token", methods=["POST"])
+def create_new_accounts_link_token():
+    """Create a Link token in update mode with account_selection_enabled.
+    Used when NEW_ACCOUNTS_AVAILABLE webhook fires — lets user add new accounts."""
+    try:
+        from plaid.model.link_token_account_filters import LinkTokenAccountFilters
+
+        data    = request.get_json() or {}
+        user_id = str(data.get("user_id", ""))
+        user    = find_user_by_id(user_id)
+
+        if not user or not user.plaid_access_token:
+            return jsonify({"error": "No bank account connected"}), 400
+
+        req = LinkTokenCreateRequest(
+            user=LinkTokenCreateRequestUser(client_user_id=user_id),
+            client_name="EverNest",
+            country_codes=[CountryCode("US")],
+            language="en",
+            webhook="https://evernest-swz9.onrender.com/plaid/webhook",
+            redirect_uri=PLAID_REDIRECT_URI,
+            access_token=user.plaid_access_token,
+            update={"account_selection_enabled": True},
+        )
+        response   = plaid_client.link_token_create(req)
+        link_token = response["link_token"]
+        print(f"[PLAID] Created account selection link token for user {user_id}")
+        return jsonify({"link_token": link_token})
+
+    except plaid.ApiException as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/plaid/new_accounts_complete", methods=["POST"])
+def plaid_new_accounts_complete():
+    """Called after user completes the account selection flow. Clears the flag."""
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = find_user_by_id(user_id)
+    if user:
+        user.plaid_new_accounts = False
+        db.session.commit()
+        print(f"[PLAID] Cleared new_accounts flag for user {user_id}")
+    return jsonify({"success": True})
+
+
 @app.route("/plaid/status", methods=["GET"])
 def plaid_connection_status():
-    """Check if the user's bank connection needs re-authentication."""
+    """Check if the user's bank connection needs re-authentication or has new accounts."""
     user_id = request.args.get("user_id", "")
     user    = find_user_by_id(user_id)
     if not user:
-        return jsonify({"connected": False, "reauth_required": False})
+        return jsonify({"connected": False, "reauth_required": False, "new_accounts": False})
     return jsonify({
         "connected":       bool(user.plaid_access_token),
         "reauth_required": bool(getattr(user, 'plaid_reauth_required', False)),
+        "new_accounts":    bool(getattr(user, 'plaid_new_accounts', False)),
     })
     
 @app.route("/plaid/link")
@@ -1902,6 +1950,11 @@ def plaid_webhook():
 
             elif webhook_code == "NEW_ACCOUNTS_AVAILABLE":
                 print(f"[PLAID WEBHOOK] New accounts available for item {item_id}")
+                user = User.query.filter_by(plaid_item_id=item_id).first()
+                if user:
+                    user.plaid_new_accounts = True
+                    db.session.commit()
+                    print(f"[PLAID WEBHOOK] Flagged user {user.id} for new accounts")
 
             elif webhook_code == "LOGIN_REPAIRED":
                 print(f"[PLAID WEBHOOK] Login repaired for item {item_id}")
@@ -2050,6 +2103,9 @@ def migrate_plaid():
             ))
             conn.execute(db.text(
                 "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS plaid_reauth_required BOOLEAN DEFAULT FALSE"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS plaid_new_accounts BOOLEAN DEFAULT FALSE"
             ))
             conn.commit()
         return "Plaid migration successful", 200
