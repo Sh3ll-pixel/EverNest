@@ -1338,7 +1338,12 @@ def remove_bank():
     user.plaid_item_id         = None
     user.plaid_reauth_required = False
     user.plaid_new_accounts    = False
+
+    # Delete balance snapshots derived from Plaid data
+    BalanceSnapshot.query.filter_by(user_id=str(user.id)).delete()
+
     db.session.commit()
+    print(f"[PLAID] Cleaned up all Plaid data for user {user_id}")
     return jsonify({"success": True})
  
  
