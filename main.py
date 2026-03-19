@@ -6,6 +6,9 @@ import calendar as cal_mod
 import webbrowser
 import base64
 import io
+import subprocess
+import tempfile
+import platform
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image, ImageTk, ImageDraw
@@ -24,6 +27,38 @@ def resource_path(relative_path):
 
 API_BASE = "https://evernest-swz9.onrender.com"
 active_signup_window = None
+
+# ── App Version ───────────────────────────────────────────────────────────────
+APP_VERSION = "1.0.0"
+
+# ── Auth Token ────────────────────────────────────────────────────────────────
+_auth_token = {"token": None}
+
+
+def _auth_headers():
+    """Return headers dict with Bearer token if available."""
+    headers = {"Content-Type": "application/json"}
+    if _auth_token["token"]:
+        headers["Authorization"] = f"Bearer {_auth_token['token']}"
+    return headers
+
+
+def api_get(path, params=None, timeout=10):
+    """Make an authenticated GET request to the API."""
+    return requests.get(f"{API_BASE}{path}", params=params,
+                         headers=_auth_headers(), timeout=timeout)
+
+
+def api_post(path, json=None, timeout=10):
+    """Make an authenticated POST request to the API."""
+    return requests.post(f"{API_BASE}{path}", json=json,
+                          headers=_auth_headers(), timeout=timeout)
+
+
+def api_delete(path, json=None, timeout=10):
+    """Make an authenticated DELETE request to the API."""
+    return requests.delete(f"{API_BASE}{path}", json=json,
+                            headers=_auth_headers(), timeout=timeout)
 
 # Subscription cache
 _sub_cache = {"subscribed": False, "checked": False}
@@ -87,6 +122,165 @@ def register_accent_widget(widget, role="button"):
     _accent["widgets"].append((widget, role))
 
 _load_accent_color()
+
+
+# =============================================================================
+#  AUTO-UPDATER
+# =============================================================================
+
+def _compare_versions(local, remote):
+    """Return True if remote is newer than local."""
+    try:
+        l_parts = [int(x) for x in local.split(".")]
+        r_parts = [int(x) for x in remote.split(".")]
+        return r_parts > l_parts
+    except Exception:
+        return False
+
+
+def check_for_updates():
+    """Check the server for a newer version and auto-apply if found.
+
+    Called in a background thread after login. On Windows, downloads the
+    new installer and runs it with /VERYSILENT which closes the running
+    app, installs the update, and relaunches automatically.
+    """
+    def _do():
+        try:
+            resp = requests.get(f"{API_BASE}/version", timeout=8)
+            if not resp.ok:
+                return
+            data = resp.json()
+            remote_version = data.get("version", APP_VERSION)
+
+            if not _compare_versions(APP_VERSION, remote_version):
+                print(f"[UPDATER] Up to date (v{APP_VERSION})")
+                return
+
+            print(f"[UPDATER] New version available: v{remote_version} (current: v{APP_VERSION})")
+
+            # Determine download URL for this platform
+            system = platform.system().lower()
+            downloads = data.get("downloads", {})
+            if system == "windows":
+                url = downloads.get("windows")
+                ext = ".exe"
+            elif system == "darwin":
+                url = downloads.get("mac")
+                ext = ".dmg"
+            else:
+                url = downloads.get("linux")
+                ext = ".deb"
+
+            if not url:
+                print("[UPDATER] No download URL for this platform")
+                return
+
+            # Download to temp folder
+            print(f"[UPDATER] Downloading update...")
+            dl_resp = requests.get(url, stream=True, timeout=120,
+                                    allow_redirects=True)
+            if not dl_resp.ok:
+                print(f"[UPDATER] Download failed: {dl_resp.status_code}")
+                return
+
+            tmp_dir = tempfile.mkdtemp(prefix="evernest_update_")
+            tmp_file = os.path.join(tmp_dir, f"EverNest_Update{ext}")
+
+            with open(tmp_file, "wb") as f:
+                for chunk in dl_resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            file_size = os.path.getsize(tmp_file)
+            print(f"[UPDATER] Downloaded {file_size / 1024 / 1024:.1f} MB")
+
+            if file_size < 50000:  # Less than 50KB = probably a 404 page
+                print("[UPDATER] File too small — likely not a valid installer")
+                return
+
+            # Apply update based on platform
+            if system == "windows":
+                _apply_update_windows(tmp_file)
+            elif system == "darwin":
+                _apply_update_mac(tmp_file)
+            else:
+                _apply_update_linux(tmp_file)
+
+        except requests.RequestException as e:
+            print(f"[UPDATER] Network error: {e}")
+        except Exception as e:
+            print(f"[UPDATER] Error: {e}")
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _apply_update_windows(installer_path):
+    """Run Inno Setup installer in silent mode. It will:
+    - Close the running EverNest process
+    - Install the new version over the old one
+    - Relaunch EverNest automatically
+    """
+    print("[UPDATER] Launching silent installer...")
+    try:
+        subprocess.Popen(
+            [installer_path,
+             "/VERYSILENT",
+             "/SUPPRESSMSGBOXES",
+             "/CLOSEAPPLICATIONS",
+             "/RESTARTAPPLICATIONS",
+             "/NORESTART"],
+            shell=False,
+            creationflags=subprocess.DETACHED_PROCESS
+        )
+        print("[UPDATER] Installer started — closing app for update...")
+        os._exit(0)
+    except Exception as e:
+        print(f"[UPDATER] Failed to launch installer: {e}")
+
+
+def _apply_update_mac(dmg_path):
+    """Mount DMG and copy .app to /Applications."""
+    print("[UPDATER] Applying macOS update...")
+    try:
+        result = subprocess.run(
+            ["hdiutil", "attach", dmg_path, "-nobrowse", "-quiet"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(f"[UPDATER] Failed to mount DMG: {result.stderr}")
+            return
+
+        mount_point = None
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("\t")
+            if len(parts) >= 3 and "/Volumes/" in parts[-1]:
+                mount_point = parts[-1].strip()
+
+        if not mount_point:
+            return
+
+        app_src = os.path.join(mount_point, "EverNest.app")
+        app_dest = "/Applications/EverNest.app"
+
+        if os.path.exists(app_src):
+            subprocess.run(["rm", "-rf", app_dest], timeout=10)
+            subprocess.run(["cp", "-R", app_src, app_dest], timeout=30)
+
+        subprocess.run(["hdiutil", "detach", mount_point, "-quiet"], timeout=10)
+        subprocess.Popen(["open", app_dest])
+        os._exit(0)
+    except Exception as e:
+        print(f"[UPDATER] macOS update failed: {e}")
+
+
+def _apply_update_linux(deb_path):
+    """Install .deb package using pkexec for privilege escalation."""
+    print("[UPDATER] Applying Linux update...")
+    try:
+        subprocess.Popen(["pkexec", "dpkg", "-i", deb_path], shell=False)
+        os._exit(0)
+    except Exception as e:
+        print(f"[UPDATER] Linux update failed: {e}")
 
 
 def b64_to_ctk_image(b64_string, size=(40, 40)):
@@ -333,6 +527,9 @@ def render_main_application(app_window, user_data=None):
 
     switch_tab("Dashboard")
 
+    # Check for updates in background after app loads
+    check_for_updates()
+
 
 # =============================================================================
 # Settings Tab
@@ -423,7 +620,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
         def _remove_pfp():
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/profile/upload_picture",
+                    resp = api_post("/profile/upload_picture",
                                           json={"user_id": user_id, "image": ""},
                                           timeout=10)
                     if resp.ok:
@@ -460,7 +657,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/settings/update_profile",
+                    resp = api_post("/settings/update_profile",
                                           json={"user_id": user_id, "username": new_val},
                                           timeout=10)
                     if resp.ok:
@@ -491,7 +688,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/settings/update_profile",
+                    resp = api_post("/settings/update_profile",
                                           json={"user_id": user_id, "email": new_val},
                                           timeout=10)
                     if resp.ok:
@@ -527,7 +724,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/settings/change_password",
+                    resp = api_post("/settings/change_password",
                                           json={"user_id": user_id,
                                                 "current_password": c,
                                                 "new_password": n},
@@ -581,7 +778,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
     def load_sub_status():
         def _do():
             try:
-                resp = requests.get(f"{API_BASE}/subscription/status",
+                resp = api_get("/subscription/status",
                                      params={"user_id": user_id}, timeout=6)
                 if resp.ok:
                     data = resp.json()
@@ -607,7 +804,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
     def cancel_subscription():
         def _do():
             try:
-                resp = requests.post(f"{API_BASE}/subscription/cancel",
+                resp = api_post("/subscription/cancel",
                                       json={"user_id": user_id}, timeout=10)
                 if resp.ok:
                     parent.after(0, lambda: [
@@ -667,31 +864,74 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
     #  BANK ACCOUNT
     # =========================================================================
     section_header("🏦  Bank Account")
- 
-    def remove_bank_widget(row):
-        ctk.CTkLabel(row, text="Disconnect your linked Plaid bank account.",
-                      fg_color="transparent", text_color="#9A9A9A",
-                      font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
-        ctk.CTkButton(row, text="Remove Bank Account", width=180, height=32,
-                       fg_color="transparent", hover_color="#2a1520",
-                       text_color="#ff6b6b", corner_radius=8,
-                       border_width=1, border_color="#ff6b6b",
-                       command=remove_bank).pack(side="left")
-    setting_row("Linked Bank", remove_bank_widget)
- 
+
     def remove_bank():
         def _do():
             try:
-                resp = requests.post(f"{API_BASE}/settings/remove_bank",
+                resp = api_post("/settings/remove_bank",
                                       json={"user_id": user_id}, timeout=10)
                 if resp.ok:
-                    parent.after(0, lambda: status_var.set(
-                        "✓  Bank account disconnected."))
+                    parent.after(0, lambda: [
+                        status_var.set("✓  Bank account disconnected."),
+                        status_lbl.configure(text_color="#4CFF7A"),
+                        bank_status_label.configure(
+                            text="No bank connected",
+                            text_color="#4b5563"),
+                        remove_btn.configure(state="disabled", text="Disconnected"),
+                    ])
                 else:
                     parent.after(0, lambda: status_var.set("Failed to remove bank."))
             except Exception as ex:
                 parent.after(0, lambda: status_var.set(f"Error: {ex}"))
         threading.Thread(target=_do, daemon=True).start()
+
+    def remove_bank_widget(row):
+        nonlocal bank_status_label, remove_btn
+        bank_status_label = ctk.CTkLabel(row, text="Checking…",
+                      fg_color="transparent", text_color="#9A9A9A",
+                      font=ctk.CTkFont(size=12))
+        bank_status_label.pack(side="left", padx=(0, 16))
+
+        remove_btn = ctk.CTkButton(row, text="Disconnect Bank", width=160, height=32,
+                       fg_color="#ff6b6b", hover_color="#cc5555",
+                       text_color="#ffffff", corner_radius=8,
+                       font=ctk.CTkFont(size=12, weight="bold"),
+                       command=remove_bank)
+        remove_btn.pack(side="left")
+
+    bank_status_label = None
+    remove_btn = None
+    setting_row("Linked Bank", remove_bank_widget)
+
+    # Check if bank is actually connected
+    def _check_bank_status():
+        try:
+            resp = api_get("/plaid/status",
+                                 params={"user_id": user_id}, timeout=6)
+            if resp.ok:
+                data = resp.json()
+                connected = data.get("connected", False)
+                reauth    = data.get("reauth_required", False)
+                def _update():
+                    if bank_status_label and bank_status_label.winfo_exists():
+                        if connected and reauth:
+                            bank_status_label.configure(
+                                text="⚠️ Connected — needs re-authentication",
+                                text_color="#ff6b6b")
+                        elif connected:
+                            bank_status_label.configure(
+                                text="✓ Bank account connected",
+                                text_color="#4ade80")
+                        else:
+                            bank_status_label.configure(
+                                text="No bank connected",
+                                text_color="#4b5563")
+                            if remove_btn and remove_btn.winfo_exists():
+                                remove_btn.configure(state="disabled")
+                parent.after(0, _update)
+        except Exception:
+            pass
+    threading.Thread(target=_check_bank_status, daemon=True).start()
  
     # =========================================================================
     #  NOTIFICATIONS
@@ -725,7 +965,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    requests.post(f"{API_BASE}/settings/report_bug",
+                    api_post("/settings/report_bug",
                                    json={"user_id": user_id, "description": desc},
                                    timeout=10)
                     parent.after(0, lambda: [
@@ -784,7 +1024,7 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    resp = requests.delete(f"{API_BASE}/settings/delete_account",
+                    resp = api_delete("/settings/delete_account",
                                             json={"user_id": user_id}, timeout=10)
                     if resp.ok:
                         parent.after(0, lambda: [
@@ -1156,7 +1396,7 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
 
         # 1) Net worth + record snapshot
         try:
-            resp = requests.get(f"{API_BASE}/plaid/accounts",
+            resp = api_get("/plaid/accounts",
                                  params={"user_id": user_id}, timeout=10)
             if resp.ok:
                 accounts = resp.json().get("accounts", [])
@@ -1166,7 +1406,7 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
                     nw_text  = f"${net_worth:,.2f}"
                     nw_color = "#4ade80" if net_worth >= 0 else "#f87171"
                     try:
-                        requests.post(f"{API_BASE}/balance/snapshot",
+                        api_post("/balance/snapshot",
                                        json={"user_id": user_id, "net_worth": net_worth}, timeout=6)
                     except Exception:
                         pass
@@ -1183,9 +1423,24 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
                 text="Across all accounts" if has_bank else "Connect a bank to start")
         parent.after(0, _up_nw)
 
+        # Check if bank needs re-authentication
+        needs_reauth = False
+        if has_bank:
+            try:
+                resp = api_get("/plaid/status",
+                                     params={"user_id": user_id}, timeout=6)
+                if resp.ok and resp.json().get("reauth_required"):
+                    needs_reauth = True
+                    def _show_reauth_warning():
+                        card_labels["Net Worth"]["sub"].configure(
+                            text="⚠️ Bank needs reconnection", text_color="#ff6b6b")
+                    parent.after(0, _show_reauth_warning)
+            except Exception:
+                pass
+
         # 2) Balance history for chart
         try:
-            resp = requests.get(f"{API_BASE}/balance/history",
+            resp = api_get("/balance/history",
                                  params={"user_id": user_id, "days": 30}, timeout=10)
             if resp.ok:
                 snapshots = resp.json().get("snapshots", [])
@@ -1198,13 +1453,13 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
             today = datetime.date.today()
             week_end = today + datetime.timedelta(days=7)
             all_events = []
-            resp = requests.get(f"{API_BASE}/calendar/events",
+            resp = api_get("/calendar/events",
                                  params={"user_id": user_id, "year": today.year, "month": today.month},
                                  timeout=10)
             if resp.ok:
                 all_events.extend(resp.json().get("events", []))
             if week_end.month != today.month:
-                resp2 = requests.get(f"{API_BASE}/calendar/events",
+                resp2 = api_get("/calendar/events",
                                       params={"user_id": user_id, "year": week_end.year, "month": week_end.month},
                                       timeout=10)
                 if resp2.ok:
@@ -1242,14 +1497,14 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
 
         # 4) Budget + transactions
         try:
-            resp = requests.get(f"{API_BASE}/budget",
+            resp = api_get("/budget",
                                  params={"user_id": user_id}, timeout=10)
             budget = resp.json().get("budget") if resp.ok else None
             if budget and budget.get("income", 0) > 0:
                 has_budget = True
             txns = []
             try:
-                resp2 = requests.get(f"{API_BASE}/plaid/transactions",
+                resp2 = api_get("/plaid/transactions",
                                       params={"user_id": user_id}, timeout=10)
                 if resp2.ok:
                     txns = resp2.json().get("transactions", [])
@@ -1262,27 +1517,38 @@ def render_dashboard_tab(parent, username, email, user_data=None, switch_tab_fn=
         # 5) Profile picture
         if not has_pfp:
             try:
-                resp = requests.get(f"{API_BASE}/profile/picture",
+                resp = api_get("/profile/picture",
                                      params={"user_id": user_id}, timeout=6)
                 if resp.ok and resp.json().get("image"):
                     has_pfp = True
             except Exception:
                 pass
 
-        # 6) Setup banner
-        incomplete = []
-        if not has_pfp:   incomplete.append(("profile picture", "Settings"))
-        if not has_bank:  incomplete.append(("bank account", "Financial"))
-        if not has_events: incomplete.append(("calendar events", "Calendar"))
-        if not has_budget: incomplete.append(("budget", "Budget"))
-
-        if incomplete:
-            hint, target = f"Finish setup: add {incomplete[0][0]}", incomplete[0][1]
-            def _show_banner():
-                banner_label.configure(text=hint)
-                banner_btn.configure(command=lambda t=target: switch_tab_fn(t) if switch_tab_fn else None)
+        # 6) Setup banner — prioritize reauth warning
+        if needs_reauth:
+            def _show_reauth_banner():
+                banner_label.configure(text="⚠️ Your bank connection needs to be refreshed")
+                banner_btn.configure(
+                    text="Fix →",
+                    command=lambda: switch_tab_fn("Financial") if switch_tab_fn else None)
+                setup_banner.configure(fg_color="#2a1a1a", border_color="#ff6b6b")
+                banner_label.configure(text_color="#ff6b6b")
                 setup_banner.place(x=440, y=20)
-            parent.after(0, _show_banner)
+            parent.after(0, _show_reauth_banner)
+        else:
+            incomplete = []
+            if not has_pfp:   incomplete.append(("profile picture", "Settings"))
+            if not has_bank:  incomplete.append(("bank account", "Financial"))
+            if not has_events: incomplete.append(("calendar events", "Calendar"))
+            if not has_budget: incomplete.append(("budget", "Budget"))
+
+            if incomplete:
+                hint, target = f"Finish setup: add {incomplete[0][0]}", incomplete[0][1]
+                def _show_banner():
+                    banner_label.configure(text=hint)
+                    banner_btn.configure(command=lambda t=target: switch_tab_fn(t) if switch_tab_fn else None)
+                    setup_banner.place(x=440, y=20)
+                parent.after(0, _show_banner)
 
     def fetch_weather():
         try:
@@ -1408,7 +1674,7 @@ def render_family_tab(parent, user_data=None, switch_tab_fn=None):
             name = family_name_entry.get().strip() or "My Family"
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/family/create",
+                    resp = api_post("/family/create",
                                           json={"user_id": user_id, "name": name}, timeout=10)
                     data = resp.json()
                     if resp.ok and data.get("success"):
@@ -1518,7 +1784,7 @@ def render_family_tab(parent, user_data=None, switch_tab_fn=None):
         def do_leave():
             def _do():
                 try:
-                    requests.post(f"{API_BASE}/family/leave",
+                    api_post("/family/leave",
                                    json={"user_id": user_id}, timeout=10)
                     parent.after(0, load_family)
                 except Exception:
@@ -1560,7 +1826,7 @@ def render_family_tab(parent, user_data=None, switch_tab_fn=None):
                 return
             def _do():
                 try:
-                    resp = requests.post(f"{API_BASE}/family/invite",
+                    resp = api_post("/family/invite",
                                           json={"user_id": user_id, "email": email},
                                           timeout=10)
                     data = resp.json()
@@ -1605,7 +1871,7 @@ def render_family_tab(parent, user_data=None, switch_tab_fn=None):
     def respond_invite(invite_id, accept):
         def _do():
             try:
-                requests.post(f"{API_BASE}/family/invite/respond",
+                api_post("/family/invite/respond",
                                json={"user_id": user_id, "invite_id": invite_id,
                                      "accept": accept}, timeout=10)
                 parent.after(0, load_family)
@@ -1619,7 +1885,7 @@ def render_family_tab(parent, user_data=None, switch_tab_fn=None):
         status_var.set("Loading…")
         def _do():
             try:
-                resp = requests.get(f"{API_BASE}/family/info",
+                resp = api_get("/family/info",
                                      params={"user_id": user_id}, timeout=10)
                 if resp.ok:
                     data = resp.json()
@@ -1663,6 +1929,205 @@ def render_financial_tab(parent, user_data=None, switch_tab_fn=None):
     status_var = ctk.StringVar(value="")
     ctk.CTkLabel(parent, textvariable=status_var, fg_color="transparent",
                  text_color="#7B93DB", font=ctk.CTkFont(size=12), width=500).place(x=30, y=92)
+
+    # ── Reauth warning banner (hidden by default) ────────────────────────────
+    reauth_banner = ctk.CTkFrame(parent, fg_color="#2a1a1a", width=820, height=50,
+                                   corner_radius=8, border_width=1, border_color="#ff6b6b")
+    # Don't place yet — shown only if needed
+
+    ctk.CTkLabel(reauth_banner, text="⚠️  Your bank connection needs to be refreshed",
+                  fg_color="transparent", text_color="#ff6b6b",
+                  font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=4)
+    ctk.CTkLabel(reauth_banner, text="Your bank credentials have changed or expired. Reconnect to keep your data up to date.",
+                  fg_color="transparent", text_color="#9a6b6b",
+                  font=ctk.CTkFont(size=11)).place(x=16, y=26)
+
+    user_id = ""
+    if user_data:
+        user_id = str(user_data.get("id") or user_data.get("username", ""))
+
+    def dismiss_reauth_banner():
+        """Hide the reauth banner and reset panel positions."""
+        reauth_banner.place_forget()
+        accounts_panel.place(x=30, y=122)
+        tx_panel.place(x=430, y=122)
+        status_var.set("✓  Bank connection restored.")
+
+    def verify_reauth_complete():
+        """Re-check if reauth is still needed and dismiss banner if cleared."""
+        verify_btn.configure(state="disabled", text="Checking…")
+        def _do():
+            try:
+                resp = api_get("/plaid/status",
+                                     params={"user_id": user_id}, timeout=6)
+                if resp.ok:
+                    data = resp.json()
+                    if not data.get("reauth_required"):
+                        parent.after(0, dismiss_reauth_banner)
+                    else:
+                        parent.after(0, lambda: status_var.set(
+                            "Still waiting — complete re-authentication in browser, then try again."))
+            except Exception:
+                pass
+            finally:
+                parent.after(0, lambda: verify_btn.configure(
+                    state="normal", text="I've reconnected — Refresh"))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def open_reauth():
+        """Open Plaid Link in update mode to re-authenticate."""
+        reauth_btn.configure(state="disabled", text="Opening…")
+        def _do():
+            try:
+                resp = api_post("/plaid/update_link_token",
+                                      json={"user_id": user_id}, timeout=10)
+                if resp.ok:
+                    link_token = resp.json().get("link_token")
+                    if link_token:
+                        url = f"{API_BASE}/plaid/link?user_id={user_id}"
+                        webbrowser.open(url)
+                        parent.after(0, lambda: [
+                            status_var.set("Re-authentication opened in browser."),
+                            # Show verify button, hide reconnect button
+                            reauth_btn.place_forget(),
+                            verify_btn.place(x=570, y=10),
+                        ])
+                else:
+                    parent.after(0, lambda: status_var.set("Failed to start re-authentication."))
+            except Exception as e:
+                parent.after(0, lambda: status_var.set(f"Error: {e}"))
+            finally:
+                parent.after(0, lambda: reauth_btn.configure(state="normal", text="Reconnect Bank"))
+        threading.Thread(target=_do, daemon=True).start()
+
+    reauth_btn = ctk.CTkButton(reauth_banner, text="Reconnect Bank", width=130, height=30,
+                                fg_color="#ff6b6b", hover_color="#cc5555",
+                                text_color="#ffffff", corner_radius=6,
+                                font=ctk.CTkFont(size=12, weight="bold"),
+                                command=open_reauth)
+    reauth_btn.place(x=670, y=10)
+
+    verify_btn = ctk.CTkButton(reauth_banner, text="I've reconnected — Refresh",
+                                width=200, height=30,
+                                fg_color="#3b5bdb", hover_color="#2b4bc8",
+                                text_color="#ffffff", corner_radius=6,
+                                font=ctk.CTkFont(size=12, weight="bold"),
+                                command=verify_reauth_complete)
+    # verify_btn is placed only after user clicks Reconnect
+
+    # ── New Accounts Available banner (hidden by default) ─────────────────────
+    new_acct_banner = ctk.CTkFrame(parent, fg_color="#1a2232", width=820, height=50,
+                                     corner_radius=8, border_width=1, border_color="#5b6ef7")
+
+    ctk.CTkLabel(new_acct_banner, text="🏦  New accounts detected at your bank",
+                  fg_color="transparent", text_color="#8b9cf7",
+                  font=ctk.CTkFont(size=13, weight="bold")).place(x=16, y=4)
+    ctk.CTkLabel(new_acct_banner, text="Your bank has new accounts available. Add them to EverNest to track all your finances.",
+                  fg_color="transparent", text_color="#5b6a8a",
+                  font=ctk.CTkFont(size=11)).place(x=16, y=26)
+
+    def open_account_selection():
+        """Open Plaid Link in update mode with account_selection_enabled."""
+        add_acct_btn.configure(state="disabled", text="Opening…")
+        def _do():
+            try:
+                resp = api_post("/plaid/new_accounts_link_token",
+                                      json={"user_id": user_id}, timeout=10)
+                if resp.ok:
+                    link_token = resp.json().get("link_token")
+                    if link_token:
+                        url = f"{API_BASE}/plaid/link?user_id={user_id}"
+                        webbrowser.open(url)
+                        parent.after(0, lambda: [
+                            add_acct_btn.place_forget(),
+                            done_acct_btn.place(x=570, y=10),
+                            status_var.set("Account selection opened in browser."),
+                        ])
+                else:
+                    parent.after(0, lambda: status_var.set("Failed to open account selection."))
+            except Exception as e:
+                parent.after(0, lambda: status_var.set(f"Error: {e}"))
+            finally:
+                parent.after(0, lambda: add_acct_btn.configure(state="normal", text="Add Accounts"))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def dismiss_new_acct_banner():
+        """Hide the new accounts banner and reset positions."""
+        new_acct_banner.place_forget()
+        accounts_panel.place(x=30, y=122)
+        tx_panel.place(x=430, y=122)
+        status_var.set("✓  Accounts updated.")
+
+    def verify_new_accounts_done():
+        """Clear the new_accounts flag and dismiss the banner."""
+        done_acct_btn.configure(state="disabled", text="Checking…")
+        def _do():
+            try:
+                api_post("/plaid/new_accounts_complete",
+                               json={"user_id": user_id}, timeout=6)
+                parent.after(0, dismiss_new_acct_banner)
+            except Exception:
+                parent.after(0, lambda: status_var.set("Failed to clear flag."))
+            finally:
+                parent.after(0, lambda: done_acct_btn.configure(
+                    state="normal", text="Done — Refresh"))
+        threading.Thread(target=_do, daemon=True).start()
+
+    add_acct_btn = ctk.CTkButton(new_acct_banner, text="Add Accounts", width=120, height=30,
+                                  fg_color="#5b6ef7", hover_color="#4a5bc6",
+                                  text_color="#ffffff", corner_radius=6,
+                                  font=ctk.CTkFont(size=12, weight="bold"),
+                                  command=open_account_selection)
+    add_acct_btn.place(x=685, y=10)
+
+    done_acct_btn = ctk.CTkButton(new_acct_banner, text="Done — Refresh",
+                                   width=160, height=30,
+                                   fg_color="#3b5bdb", hover_color="#2b4bc8",
+                                   text_color="#ffffff", corner_radius=6,
+                                   font=ctk.CTkFont(size=12, weight="bold"),
+                                   command=verify_new_accounts_done)
+    # done_acct_btn placed only after user clicks Add Accounts
+
+    dismiss_acct_btn = ctk.CTkButton(new_acct_banner, text="✕", width=28, height=28,
+                                      fg_color="transparent", hover_color="#263354",
+                                      text_color="#5b6a8a", corner_radius=4,
+                                      font=ctk.CTkFont(size=14),
+                                      command=lambda: [
+                                          dismiss_new_acct_banner(),
+                                          # Also clear the server flag so it doesn't come back
+                                          threading.Thread(target=lambda: requests.post(
+                                              f"{API_BASE}/plaid/new_accounts_complete",
+                                              json={"user_id": user_id}, timeout=6),
+                                              daemon=True).start(),
+                                      ])
+    dismiss_acct_btn.place(x=790, y=11)
+
+    # Check reauth + new accounts status in background
+    def check_plaid_status():
+        try:
+            resp = api_get("/plaid/status",
+                                 params={"user_id": user_id}, timeout=6)
+            if resp.ok:
+                data = resp.json()
+                needs_reauth = data.get("reauth_required", False)
+                has_new      = data.get("new_accounts", False)
+
+                if needs_reauth:
+                    # Reauth takes priority
+                    parent.after(0, lambda: [
+                        reauth_banner.place(x=30, y=92),
+                        accounts_panel.place(x=30, y=160),
+                        tx_panel.place(x=430, y=160),
+                    ])
+                elif has_new:
+                    parent.after(0, lambda: [
+                        new_acct_banner.place(x=30, y=92),
+                        accounts_panel.place(x=30, y=160),
+                        tx_panel.place(x=430, y=160),
+                    ])
+        except Exception:
+            pass
+    threading.Thread(target=check_plaid_status, daemon=True).start()
 
     accounts_panel = ctk.CTkScrollableFrame(parent, fg_color="#1f2328", width=380, height=460, corner_radius=8)
     accounts_panel.place(x=30, y=122)
@@ -1745,6 +2210,53 @@ def render_financial_tab(parent, user_data=None, switch_tab_fn=None):
     render_empty(tx_inner, "Connect a bank account to see transactions.")
 
     def connect_bank():
+        """Show consent notice, then open Plaid Link if user agrees."""
+        # Pre-Link consent dialog
+        consent_win = ctk.CTkToplevel(parent)
+        consent_win.title("Connect Bank Account")
+        consent_win.geometry("420x300")
+        consent_win.resizable(False, False)
+        consent_win.configure(fg_color="#0c0e14")
+        consent_win.grab_set()
+
+        ctk.CTkLabel(consent_win, text="Connect Your Bank",
+                      fg_color="transparent", text_color="#e5e7eb",
+                      font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 8))
+
+        notice_text = (
+            "EverNest uses Plaid to securely connect to your bank. "
+            "By continuing, you agree that:\n\n"
+            "• Plaid will access your account balances and transaction history\n"
+            "• EverNest will display this data within the app\n"
+            "• Your bank login credentials are handled by Plaid and never stored by EverNest\n"
+            "• You can disconnect your bank at any time in Settings\n\n"
+            "Plaid's privacy practices are governed by their End User Privacy Policy "
+            "at plaid.com/legal"
+        )
+        ctk.CTkLabel(consent_win, text=notice_text, fg_color="transparent",
+                      text_color="#9A9A9A", font=ctk.CTkFont(size=12),
+                      wraplength=370, justify="left").pack(padx=24, pady=(0, 16))
+
+        def on_agree():
+            consent_win.destroy()
+            _do_connect()
+
+        btn_row = ctk.CTkFrame(consent_win, fg_color="transparent")
+        btn_row.pack(pady=(0, 16))
+
+        ctk.CTkButton(btn_row, text="Cancel", width=100, height=32,
+                       fg_color="transparent", hover_color="#1f2328",
+                       text_color="#6b7280", corner_radius=8,
+                       border_width=1, border_color="#2a2f38",
+                       command=consent_win.destroy).pack(side="left", padx=8)
+
+        ctk.CTkButton(btn_row, text="Continue", width=140, height=32,
+                       fg_color=_accent["color"], hover_color="#2b4bc8",
+                       text_color="#ffffff", corner_radius=8,
+                       font=ctk.CTkFont(weight="bold"),
+                       command=on_agree).pack(side="left", padx=8)
+
+    def _do_connect():
         connect_btn.configure(state="disabled")
         status_var.set("Requesting Plaid Link token…")
         def _do():
@@ -1753,7 +2265,7 @@ def render_financial_tab(parent, user_data=None, switch_tab_fn=None):
                 if user_data:
                     user_id = str(user_data.get("id") or user_data.get("username", ""))
                 payload = {"user_id": user_id}
-                resp = requests.post(f"{API_BASE}/plaid/create_link_token", json=payload, timeout=15)
+                resp = api_post("/plaid/create_link_token", json=payload, timeout=15)
                 data = resp.json()
                 if resp.ok and data.get("link_token"):
                     link_url = f"{API_BASE}/plaid/link?user_id={user_id}"
@@ -1777,8 +2289,8 @@ def render_financial_tab(parent, user_data=None, switch_tab_fn=None):
                 params = {}
                 if user_data:
                     params["user_id"] = user_data.get("id") or user_data.get("username", "")
-                acct_resp = requests.get(f"{API_BASE}/plaid/accounts", params=params, timeout=15)
-                tx_resp   = requests.get(f"{API_BASE}/plaid/transactions", params=params, timeout=15)
+                acct_resp = api_get("/plaid/accounts", params=params, timeout=15)
+                tx_resp   = api_get("/plaid/transactions", params=params, timeout=15)
                 accounts     = acct_resp.json().get("accounts", []) if acct_resp.ok else []
                 transactions = tx_resp.json().get("transactions", []) if tx_resp.ok else []
                 def _update():
@@ -2115,7 +2627,7 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
         status_var.set("Loading budget…")
         def _do():
             try:
-                resp = requests.get(f"{API_BASE}/budget", params={"user_id": user_id}, timeout=10)
+                resp = api_get("/budget", params={"user_id": user_id}, timeout=10)
                 if resp.ok:
                     data = resp.json().get("budget") or {}
                     if data:
@@ -2148,7 +2660,7 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
         status_var.set("Fetching transactions…")
         def _do():
             try:
-                resp = requests.get(f"{API_BASE}/plaid/transactions",
+                resp = api_get("/plaid/transactions",
                                      params={"user_id": user_id}, timeout=15)
                 if resp.ok:
                     transactions = resp.json().get("transactions", [])
@@ -2221,7 +2733,7 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
 
         def _do():
             try:
-                requests.post(f"{API_BASE}/budget", json=payload, timeout=10)
+                api_post("/budget", json=payload, timeout=10)
                 parent.after(0, lambda: status_var.set("✓  Budget saved"))
                 parent.after(0, render_spending)
             except Exception as e:
@@ -2776,7 +3288,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
     def delete_event(event_id, date_obj):
         def _do():
             try:
-                requests.delete(f"{API_BASE}/calendar/events/{event_id}", timeout=10)
+                api_delete(f"/calendar/events/{event_id}", timeout=10)
                 parent.after(0, load_events)
             except Exception:
                 pass
@@ -3306,7 +3818,7 @@ def render_notes_tab(parent, user_data=None):
         nid = state["active_id"]
         def _do():
             try:
-                requests.delete(f"{API_BASE}/notes/{nid}", timeout=10)
+                api_delete(f"/notes/{nid}", timeout=10)
                 state["active_id"] = None
                 parent.after(0, lambda: [
                     title_entry.delete(0, "end"),
@@ -3329,7 +3841,7 @@ def render_notes_tab(parent, user_data=None):
         }
         def _do():
             try:
-                resp = requests.post(f"{API_BASE}/notes", json=payload, timeout=10)
+                resp = api_post("/notes", json=payload, timeout=10)
                 if resp.ok:
                     note = resp.json().get("note", {})
                     parent.after(0, lambda: [load_notes(), open_note(note)])
@@ -3341,7 +3853,7 @@ def render_notes_tab(parent, user_data=None):
     def load_notes():
         def _do():
             try:
-                resp = requests.get(f"{API_BASE}/notes",
+                resp = api_get("/notes",
                                      params={"user_id": user_id}, timeout=10)
                 if resp.ok:
                     state["notes"] = resp.json().get("notes", [])
@@ -3440,6 +3952,7 @@ def login_request(email, password):
                                   json={"login": email, "password": password}, timeout=10)
         data = response.json()
         if response.ok and data.get("success"):
+            _auth_token["token"] = data.get("token")
             main.after(0, close_signup_if_open)
             main.after(0, lambda: open_application_window(data.get("user")))
         else:
