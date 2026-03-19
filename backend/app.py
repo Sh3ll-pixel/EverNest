@@ -1541,25 +1541,125 @@ def get_realtime_balance():
 
 @app.route("/plaid/transactions", methods=["GET"])
 def get_transactions():
+    """Fetch transactions with proper pagination as required by Plaid."""
     try:
         user_id = request.args.get("user_id")
+        days    = request.args.get("days", 30, type=int)
         user    = find_user_by_id(user_id)
 
         if not user or not user.plaid_access_token:
             return jsonify({"transactions": []})
 
         end_date   = datetime.date.today()
-        start_date = end_date - datetime.timedelta(days=30)
+        start_date = end_date - datetime.timedelta(days=days)
 
-        req = TransactionsGetRequest(
+        all_transactions = []
+        total_transactions = None
+        offset = 0
+        page_size = 100
+
+        # Paginate through all transactions
+        while True:
+            req = TransactionsGetRequest(
+                access_token=user.plaid_access_token,
+                start_date=start_date,
+                end_date=end_date,
+                options=TransactionsGetRequestOptions(
+                    count=page_size,
+                    offset=offset
+                ),
+            )
+            response = plaid_client.transactions_get(req)
+
+            transactions = [t.to_dict() for t in response["transactions"]]
+            all_transactions.extend(transactions)
+
+            if total_transactions is None:
+                total_transactions = response["total_transactions"]
+
+            offset += len(transactions)
+
+            # Stop when we've fetched all transactions or got an empty page
+            if offset >= total_transactions or len(transactions) == 0:
+                break
+
+            # Safety limit to prevent infinite loops
+            if offset > 5000:
+                break
+
+        print(f"[PLAID TXN] Fetched {len(all_transactions)}/{total_transactions} transactions for user {user_id}")
+        return jsonify({
+            "transactions": all_transactions,
+            "total": total_transactions,
+        })
+
+    except plaid.ApiException as e:
+        # Check for ITEM_LOGIN_REQUIRED
+        try:
+            error_body = json.loads(e.body) if hasattr(e, 'body') else {}
+            error_code = error_body.get("error_code", "")
+        except Exception:
+            error_code = ""
+
+        if error_code == "ITEM_LOGIN_REQUIRED":
+            print(f"[PLAID TXN] User {user_id} needs to re-authenticate bank connection")
+            return jsonify({
+                "transactions": [],
+                "error": "ITEM_LOGIN_REQUIRED",
+                "message": "Your bank connection has expired. Please reconnect your bank account.",
+            }), 400
+
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/plaid/transactions/refresh", methods=["POST"])
+def refresh_transactions():
+    """Force a refresh of transaction data from the bank.
+    Plaid will send a TRANSACTIONS webhook when new data is available."""
+    try:
+        from plaid.model.transactions_refresh_request import TransactionsRefreshRequest
+
+        data    = request.get_json() or {}
+        user_id = str(data.get("user_id", ""))
+        user    = find_user_by_id(user_id)
+
+        if not user or not user.plaid_access_token:
+            return jsonify({"error": "No bank account connected"}), 400
+
+        req = TransactionsRefreshRequest(access_token=user.plaid_access_token)
+        plaid_client.transactions_refresh(req)
+        print(f"[PLAID TXN] Triggered refresh for user {user_id}")
+        return jsonify({"success": True, "message": "Refresh triggered. New data will arrive via webhook."})
+
+    except plaid.ApiException as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/plaid/update_link_token", methods=["POST"])
+def create_update_link_token():
+    """Create a Link token in update mode for re-authentication.
+    Used when ITEM_LOGIN_REQUIRED error occurs."""
+    try:
+        data    = request.get_json() or {}
+        user_id = str(data.get("user_id", ""))
+        user    = find_user_by_id(user_id)
+
+        if not user or not user.plaid_access_token:
+            return jsonify({"error": "No bank account connected"}), 400
+
+        req = LinkTokenCreateRequest(
+            user=LinkTokenCreateRequestUser(client_user_id=user_id),
+            client_name="EverNest",
+            country_codes=[CountryCode("US")],
+            language="en",
+            webhook="https://evernest-swz9.onrender.com/plaid/webhook",
             access_token=user.plaid_access_token,
-            start_date=start_date,
-            end_date=end_date,
-            options=TransactionsGetRequestOptions(count=100),
         )
-        response     = plaid_client.transactions_get(req)
-        transactions = [t.to_dict() for t in response["transactions"]]
-        return jsonify({"transactions": transactions})
+        response   = plaid_client.link_token_create(req)
+        link_token = response["link_token"]
+        print(f"[PLAID] Created update mode link token for user {user_id}")
+        return jsonify({"link_token": link_token})
+
     except plaid.ApiException as e:
         return jsonify({"error": str(e)}), 400
     
