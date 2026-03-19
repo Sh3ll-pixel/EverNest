@@ -1816,6 +1816,7 @@ def plaid_link_page():
                 const handler = Plaid.create({
                     token: data.link_token,
                     onSuccess: function(public_token, metadata) {
+                        console.log('[PLAID LINK] SUCCESS', metadata);
                         document.getElementById("status").innerHTML = "<p>Linking account...</p>";
                         fetch("/plaid/exchange_token", {
                             method: "POST",
@@ -1830,9 +1831,38 @@ def plaid_link_page():
                                 "<p style='color:#4CFF7A'>✓ Bank connected! Close this tab and click Refresh in EverNest.</p>";
                         });
                     },
-                    onExit: function() {
+                    onExit: function(err, metadata) {
+                        console.log('[PLAID LINK] EXIT', err, metadata);
+                        fetch("/plaid/log_link_event", {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({
+                                event: "EXIT",
+                                error: err,
+                                institution: metadata && metadata.institution,
+                                link_session_id: metadata && metadata.link_session_id,
+                                status: metadata && metadata.status,
+                                user_id: userId
+                            })
+                        }).catch(() => {});
                         document.getElementById("status").innerHTML =
                             "<p>Cancelled. Close this tab and try again.</p>";
+                    },
+                    onEvent: function(eventName, metadata) {
+                        console.log('[PLAID LINK]', eventName, metadata);
+                        fetch("/plaid/log_link_event", {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({
+                                event: eventName,
+                                institution: metadata && metadata.institution_name,
+                                link_session_id: metadata && metadata.link_session_id,
+                                error_code: metadata && metadata.error_code,
+                                error_type: metadata && metadata.error_type,
+                                view_name: metadata && metadata.view_name,
+                                user_id: userId
+                            })
+                        }).catch(() => {});
                     }
                 });
                 handler.open();
@@ -1879,6 +1909,7 @@ def plaid_oauth_return():
                     token: linkToken,
                     receivedRedirectUri: window.location.href,
                     onSuccess: function(public_token, metadata) {
+                        console.log('[PLAID LINK] SUCCESS (OAuth)', metadata);
                         document.getElementById("status").innerHTML =
                             "<p>Linking account...</p>";
                         // Get user_id from localStorage
@@ -1897,7 +1928,8 @@ def plaid_oauth_return():
                             localStorage.removeItem('evernest_link_user_id');
                         });
                     },
-                    onExit: function(err) {
+                    onExit: function(err, metadata) {
+                        console.log('[PLAID LINK] EXIT (OAuth)', err, metadata);
                         if (err) {
                             document.getElementById("status").innerHTML =
                                 "<p style='color:#f87171'>Connection failed.</p>" +
@@ -1906,6 +1938,22 @@ def plaid_oauth_return():
                             document.getElementById("status").innerHTML =
                                 "<p>Cancelled. Close this tab and try again.</p>";
                         }
+                    },
+                    onEvent: function(eventName, metadata) {
+                        console.log('[PLAID LINK]', eventName, metadata);
+                        fetch("/plaid/log_link_event", {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({
+                                event: eventName,
+                                institution: metadata && metadata.institution_name,
+                                link_session_id: metadata && metadata.link_session_id,
+                                error_code: metadata && metadata.error_code,
+                                error_type: metadata && metadata.error_type,
+                                view_name: metadata && metadata.view_name,
+                                source: "oauth_return"
+                            })
+                        }).catch(() => {});
                     }
                 });
                 handler.open();
@@ -1919,6 +1967,31 @@ def plaid_oauth_return():
     </html>
     """
     return html, 200, {"Content-Type": "text/html"}
+
+
+# ── Plaid Link event logging ──────────────────────────────────────────────────
+@app.route("/plaid/log_link_event", methods=["POST"])
+def log_link_event():
+    """Log frontend Link events for conversion monitoring."""
+    data = request.get_json() or {}
+    event      = data.get("event", "")
+    user_id    = data.get("user_id", "")
+    institution = data.get("institution", "")
+    session_id = data.get("link_session_id", "")
+    error_code = data.get("error_code", "")
+    view_name  = data.get("view_name", "")
+    source     = data.get("source", "link")
+
+    parts = [f"[PLAID LINK EVENT] {event}"]
+    if institution:  parts.append(f"institution={institution}")
+    if session_id:   parts.append(f"session={session_id}")
+    if error_code:   parts.append(f"error={error_code}")
+    if view_name:    parts.append(f"view={view_name}")
+    if user_id:      parts.append(f"user={user_id}")
+    if source != "link": parts.append(f"source={source}")
+    print(" | ".join(parts))
+
+    return "", 200
 
 
 # ── Plaid webhook ────────────────────────────────────────────────────────────
