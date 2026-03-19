@@ -1434,6 +1434,7 @@ def create_link_token():
             products=[Products("transactions")],
             country_codes=[CountryCode("US")],
             language="en",
+            webhook="https://evernest-swz9.onrender.com/plaid/webhook",
         )
         response   = plaid_client.link_token_create(req)
         link_token = response["link_token"]
@@ -1582,6 +1583,93 @@ def plaid_link_page():
     </html>
     """
     return html, 200, {"Content-Type": "text/html"}
+
+
+# ── Plaid webhook ────────────────────────────────────────────────────────────
+@app.route("/plaid/webhook", methods=["POST"])
+def plaid_webhook():
+    """Handle Plaid webhook events.
+    
+    Key events:
+    - TRANSACTIONS.INITIAL_UPDATE: First batch of transactions ready
+    - TRANSACTIONS.DEFAULT_UPDATE: New transactions available
+    - TRANSACTIONS.HISTORICAL_UPDATE: Historical transactions ready
+    - TRANSACTIONS.TRANSACTIONS_REMOVED: Transactions were deleted
+    - ITEM.ERROR: Bank connection has an error (e.g. credentials expired)
+    - ITEM.PENDING_EXPIRATION: Access token expiring soon
+    - ITEM.NEW_ACCOUNTS_AVAILABLE: New accounts detected on the linked Item
+    """
+    try:
+        data = request.get_json() or {}
+        webhook_type = data.get("webhook_type", "")
+        webhook_code = data.get("webhook_code", "")
+        item_id      = data.get("item_id", "")
+
+        print(f"[PLAID WEBHOOK] {webhook_type}.{webhook_code} for item {item_id}")
+
+        if webhook_type == "TRANSACTIONS":
+            if webhook_code in ("INITIAL_UPDATE", "DEFAULT_UPDATE", "HISTORICAL_UPDATE"):
+                new_count = data.get("new_transactions", 0)
+                print(f"[PLAID WEBHOOK] {new_count} new transactions for item {item_id}")
+
+            elif webhook_code == "TRANSACTIONS_REMOVED":
+                removed = data.get("removed_transactions", [])
+                print(f"[PLAID WEBHOOK] {len(removed)} transactions removed for item {item_id}")
+
+        elif webhook_type == "ITEM":
+            if webhook_code == "ERROR":
+                error = data.get("error", {})
+                error_code = error.get("error_code", "UNKNOWN")
+                print(f"[PLAID WEBHOOK] Item error: {error_code} for item {item_id}")
+                if error_code == "ITEM_LOGIN_REQUIRED":
+                    print(f"[PLAID WEBHOOK] User needs to re-authenticate bank connection")
+
+            elif webhook_code == "PENDING_EXPIRATION":
+                print(f"[PLAID WEBHOOK] Access token expiring soon for item {item_id}")
+
+            elif webhook_code == "NEW_ACCOUNTS_AVAILABLE":
+                print(f"[PLAID WEBHOOK] New accounts available for item {item_id}")
+                # User has new accounts at their bank that can be linked.
+                # The app will pick these up next time it fetches accounts.
+
+        return "", 200
+
+    except Exception as e:
+        print(f"[PLAID WEBHOOK] Error processing webhook: {e}")
+        return "", 200  # Always return 200 so Plaid doesn't retry
+
+
+@app.route("/plaid/fire_test_webhook", methods=["POST"])
+def fire_test_webhook():
+    """Trigger a sandbox webhook for testing. Only works in sandbox mode.
+    Usage: POST /plaid/fire_test_webhook with {"access_token": "...", "webhook_code": "NEW_ACCOUNTS_AVAILABLE"}
+    """
+    try:
+        from plaid.model.sandbox_item_fire_webhook_request import SandboxItemFireWebhookRequest
+
+        data = request.get_json() or {}
+        access_token = data.get("access_token", "")
+        webhook_code = data.get("webhook_code", "NEW_ACCOUNTS_AVAILABLE")
+
+        if not access_token:
+            # Try to find an access token from any user
+            user = User.query.filter(User.plaid_access_token.isnot(None)).first()
+            if user:
+                access_token = user.plaid_access_token
+            else:
+                return jsonify({"error": "No access token available. Connect a bank account first."}), 400
+
+        req = SandboxItemFireWebhookRequest(
+            access_token=access_token,
+            webhook_code=webhook_code,
+        )
+        response = plaid_client.sandbox_item_fire_webhook(req)
+        print(f"[PLAID TEST] Fired {webhook_code} webhook")
+        return jsonify({"success": True, "response": str(response)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 
 @app.route("/migrate_subscription")
 def migrate_subscription():
