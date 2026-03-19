@@ -1463,6 +1463,15 @@ def create_link_token():
         data    = request.get_json() or {}
         user_id = str(data.get("user_id", "default_user"))
 
+        # Duplicate Item detection — if user already has a linked bank, warn them
+        user = find_user_by_id(user_id)
+        if user and user.plaid_access_token:
+            return jsonify({
+                "error": "You already have a bank account connected. "
+                         "Disconnect it in Settings before linking a new one.",
+                "duplicate": True,
+            }), 409
+
         req = LinkTokenCreateRequest(
             user=LinkTokenCreateRequestUser(client_user_id=user_id),
             client_name="EverNest",
