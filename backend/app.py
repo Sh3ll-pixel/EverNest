@@ -1642,23 +1642,37 @@ def plaid_webhook():
 @app.route("/plaid/fire_test_webhook", methods=["POST"])
 def fire_test_webhook():
     """Trigger a sandbox webhook for testing. Only works in sandbox mode.
-    Usage: POST /plaid/fire_test_webhook with {"access_token": "...", "webhook_code": "NEW_ACCOUNTS_AVAILABLE"}
+    First updates the item's webhook URL, then fires the test event.
+    Usage: POST /plaid/fire_test_webhook with {"webhook_code": "NEW_ACCOUNTS_AVAILABLE"}
     """
     try:
         from plaid.model.sandbox_item_fire_webhook_request import SandboxItemFireWebhookRequest
+        from plaid.model.item_webhook_update_request import ItemWebhookUpdateRequest
 
         data = request.get_json() or {}
         access_token = data.get("access_token", "")
         webhook_code = data.get("webhook_code", "NEW_ACCOUNTS_AVAILABLE")
 
         if not access_token:
-            # Try to find an access token from any user
             user = User.query.filter(User.plaid_access_token.isnot(None)).first()
             if user:
                 access_token = user.plaid_access_token
             else:
                 return jsonify({"error": "No access token available. Connect a bank account first."}), 400
 
+        # Step 1: Update the item's webhook URL (needed for items created before webhook was added)
+        webhook_url = "https://evernest-swz9.onrender.com/plaid/webhook"
+        try:
+            update_req = ItemWebhookUpdateRequest(
+                access_token=access_token,
+                webhook=webhook_url,
+            )
+            plaid_client.item_webhook_update(update_req)
+            print(f"[PLAID TEST] Updated webhook URL to {webhook_url}")
+        except Exception as e:
+            print(f"[PLAID TEST] Webhook URL update failed (may already be set): {e}")
+
+        # Step 2: Fire the test webhook
         req = SandboxItemFireWebhookRequest(
             access_token=access_token,
             webhook_code=webhook_code,
