@@ -31,7 +31,9 @@ if database_url.startswith("postgres://"):
 
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-this")
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
+if not app.config["SECRET_KEY"]:
+    raise RuntimeError("SECRET_KEY environment variable is required. Set it in Render dashboard.")
 
 # Fix stale/dropped connections (SSL error: decryption failed or bad record mac)
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
@@ -90,7 +92,7 @@ STRIPE_PRICE_ID       = os.getenv("STRIPE_PRICE_ID")
 PAYPAL_CLIENT_ID     = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 PAYPAL_PLAN_ID       = os.getenv("PAYPAL_PLAN_ID")
-PAYPAL_API_BASE      = "https://api-m.sandbox.paypal.com"  # change to api-m.paypal.com for live
+PAYPAL_API_BASE      = os.getenv("PAYPAL_API_BASE", "https://api-m.paypal.com")  # Live by default
  
 def get_paypal_access_token():
     import base64
@@ -1145,7 +1147,7 @@ with app.app_context():
 # ── Plaid client setup ────────────────────────────────────────────────────────
 PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
 PLAID_SECRET    = os.getenv("PLAID_SECRET")
-PLAID_ENV       = os.getenv("PLAID_ENV", "sandbox")
+PLAID_ENV       = os.getenv("PLAID_ENV", "production")
 
 _env_map = {
     "sandbox":    plaid.Environment.Sandbox,
@@ -1155,7 +1157,7 @@ _env_map = {
 plaid_client = None
 try:
     configuration = plaid.Configuration(
-        host=_env_map.get(PLAID_ENV, plaid.Environment.Sandbox),
+        host=_env_map.get(PLAID_ENV, plaid.Environment.Production),
         api_key={"clientId": PLAID_CLIENT_ID, "secret": PLAID_SECRET},
     )
     api_client   = plaid.ApiClient(configuration)
