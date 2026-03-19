@@ -11,6 +11,7 @@ from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
 from plaid.model.accounts_get_request import AccountsGetRequest
+from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
 from plaid.model.transactions_get_request import TransactionsGetRequest
 from plaid.model.transactions_get_request_options import TransactionsGetRequestOptions
 from plaid.model.country_code import CountryCode
@@ -1502,6 +1503,38 @@ def get_accounts():
                     pass
  
         return jsonify({"accounts": all_accounts})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/plaid/balance", methods=["GET"])
+def get_realtime_balance():
+    """Fetch real-time balance data using /accounts/balance/get.
+    Unlike /plaid/accounts which returns cached data, this makes a live
+    request to the financial institution for up-to-date balances.
+    """
+    try:
+        user_id = request.args.get("user_id")
+        user = find_user_by_id(user_id)
+
+        if not user or not user.plaid_access_token:
+            return jsonify({"accounts": [], "error": "No bank account connected"}), 400
+
+        req = AccountsBalanceGetRequest(access_token=user.plaid_access_token)
+        response = plaid_client.accounts_balance_get(req)
+        accounts = [a.to_dict() for a in response["accounts"]]
+
+        # Tag with owner
+        for acct in accounts:
+            acct["owner"] = user.username
+
+        print(f"[PLAID BALANCE] Fetched real-time balances for user {user_id}: {len(accounts)} accounts")
+        return jsonify({"accounts": accounts})
+
+    except plaid.ApiException as e:
+        error_body = e.body if hasattr(e, 'body') else str(e)
+        print(f"[PLAID BALANCE] Error for user {user_id}: {error_body}")
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
