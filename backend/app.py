@@ -1,11 +1,13 @@
 import os
 import datetime
-from flask import Flask, request, jsonify
+from functools import wraps
+from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_cors import CORS
 import plaid
 import json
+import jwt as pyjwt
 from plaid.api import plaid_api
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
@@ -47,6 +49,49 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
+
+# ── JWT Authentication ────────────────────────────────────────────────────────
+JWT_SECRET = app.config["SECRET_KEY"]
+JWT_EXPIRY_HOURS = 72  # Tokens last 3 days
+
+
+def generate_token(user_id):
+    """Create a JWT token for a user."""
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXPIRY_HOURS),
+        "iat": datetime.datetime.utcnow(),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def verify_token(token):
+    """Decode and verify a JWT token. Returns user_id or None."""
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload.get("user_id")
+    except pyjwt.ExpiredSignatureError:
+        return None
+    except pyjwt.InvalidTokenError:
+        return None
+
+
+def require_auth(f):
+    """Decorator that requires a valid JWT token in the Authorization header."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+        token = auth_header.split("Bearer ", 1)[1]
+        user_id = verify_token(token)
+        if user_id is None:
+            return jsonify({"error": "Invalid or expired token"}), 401
+
+        g.user_id = str(user_id)
+        return f(*args, **kwargs)
+    return decorated
 
 # ── Database models ───────────────────────────────────────────────────────────
 class User(db.Model):
@@ -119,6 +164,7 @@ def get_paypal_access_token():
  
 # ── Check subscription status ─────────────────────────────────────────────────
 @app.route("/subscription/status", methods=["GET"])
+@require_auth
 def subscription_status():
     user_id = request.args.get("user_id")
     user = find_user_by_id(user_id)
@@ -179,6 +225,7 @@ def subscription_status():
 
 # ── Debug: check what Stripe knows about a user ─────────────────────────────
 @app.route("/subscription/debug", methods=["GET"])
+@require_auth
 def subscription_debug():
     user_id = request.args.get("user_id")
     user = find_user_by_id(user_id)
@@ -218,6 +265,7 @@ def subscription_debug():
  
 # ── Stripe: create checkout session ──────────────────────────────────────────
 @app.route("/subscription/stripe/create-session", methods=["POST"])
+@require_auth
 def stripe_create_session():
     try:
         data    = request.get_json() or {}
@@ -379,6 +427,7 @@ def subscription_cancel():
  
 # ── PayPal: create subscription ───────────────────────────────────────────────
 @app.route("/subscription/paypal/create", methods=["POST"])
+@require_auth
 def paypal_create_subscription():
     try:
         data    = request.get_json() or {}
@@ -563,6 +612,7 @@ def get_family_member_ids(family_id):
 # ── Family routes ─────────────────────────────────────────────────────────────
  
 @app.route("/family/create", methods=["POST"])
+@require_auth
 def create_family():
     data    = request.get_json() or {}
     user_id = int(data.get("user_id", 0))
@@ -585,6 +635,7 @@ def create_family():
  
  
 @app.route("/family/info", methods=["GET"])
+@require_auth
 def get_family_info():
     user_id = int(request.args.get("user_id", 0))
     family, member = get_user_family(user_id)
@@ -644,6 +695,7 @@ def get_family_info():
  
  
 @app.route("/family/invite", methods=["POST"])
+@require_auth
 def invite_to_family():
     data          = request.get_json() or {}
     user_id       = int(data.get("user_id", 0))
@@ -680,6 +732,7 @@ def invite_to_family():
  
  
 @app.route("/family/invite/respond", methods=["POST"])
+@require_auth
 def respond_to_invite():
     data      = request.get_json() or {}
     user_id   = int(data.get("user_id", 0))
@@ -711,6 +764,7 @@ def respond_to_invite():
  
  
 @app.route("/family/leave", methods=["POST"])
+@require_auth
 def leave_family():
     data    = request.get_json() or {}
     user_id = int(data.get("user_id", 0))
@@ -737,6 +791,7 @@ class Note(db.Model):
 # Note Routes
 # ==============================================================================
 @app.route("/notes", methods=["GET"])
+@require_auth
 def get_notes():
     user_id = request.args.get("user_id", "")
     notes   = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
@@ -751,6 +806,7 @@ def get_notes():
  
  
 @app.route("/notes", methods=["POST"])
+@require_auth
 def create_note():
     data = request.get_json() or {}
     note = Note(
@@ -774,6 +830,7 @@ def create_note():
  
  
 @app.route("/notes/<int:note_id>", methods=["PUT"])
+@require_auth
 def update_note(note_id):
     note = Note.query.get(note_id)
     if not note:
@@ -789,6 +846,7 @@ def update_note(note_id):
  
  
 @app.route("/notes/<int:note_id>", methods=["DELETE"])
+@require_auth
 def delete_note_route(note_id):
     note = Note.query.get(note_id)
     if note:
@@ -800,6 +858,7 @@ def delete_note_route(note_id):
 # Paste alongside /login, /signup, /calendar routes
 
 @app.route("/budget", methods=["GET"])
+@require_auth
 def get_budget():
     user_id = request.args.get("user_id", "")
     budget  = Budget.query.filter_by(user_id=user_id).first()
@@ -815,6 +874,7 @@ def get_budget():
 
 
 @app.route("/budget", methods=["POST"])
+@require_auth
 def save_budget_route():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -839,6 +899,7 @@ def save_budget_route():
 # ==============================================================================
 
 @app.route("/balance/snapshot", methods=["POST"])
+@require_auth
 def record_balance_snapshot():
     """Record today's net worth for a user. Called from the dashboard on load."""
     data    = request.get_json() or {}
@@ -858,6 +919,7 @@ def record_balance_snapshot():
 
 
 @app.route("/balance/history", methods=["GET"])
+@require_auth
 def get_balance_history():
     """Return the last 30 days of net worth snapshots."""
     user_id = request.args.get("user_id", "")
@@ -896,6 +958,7 @@ class CalendarEvent(db.Model):
 # Paste these alongside your /login and /signup routes
 
 @app.route("/calendar/events", methods=["GET"])
+@require_auth
 def get_calendar_events():
     import calendar as cal_mod
 
@@ -1083,6 +1146,7 @@ def _generate_recurrence_dates(base_date, recurrence, month_start, month_end):
 
 
 @app.route("/calendar/events", methods=["POST"])
+@require_auth
 def add_calendar_event():
     data = request.get_json() or {}
     ev = CalendarEvent(
@@ -1103,6 +1167,7 @@ def add_calendar_event():
 
 
 @app.route("/calendar/events/<int:event_id>", methods=["PUT"])
+@require_auth
 def update_calendar_event(event_id):
     ev = CalendarEvent.query.get(event_id)
     if not ev:
@@ -1122,6 +1187,7 @@ def update_calendar_event(event_id):
 
 
 @app.route("/calendar/events/<int:event_id>", methods=["DELETE"])
+@require_auth
 def delete_calendar_event(event_id):
     ev = CalendarEvent.query.get(event_id)
     if ev:
@@ -1131,6 +1197,7 @@ def delete_calendar_event(event_id):
 
 
 @app.route("/calendar/debug", methods=["GET"])
+@require_auth
 def debug_calendar_events():
     """Debug route — shows raw DB values for all events of a user."""
     user_id = request.args.get("user_id", "")
@@ -1179,6 +1246,44 @@ APP_VERSION = "1.0.0"
 @app.route("/")
 def home():
     return "API running", 200
+
+
+@app.route("/admin/grant_subscription", methods=["POST"])
+def admin_grant_subscription():
+    """Grant a free subscription to a user. Requires admin_key for security.
+    Usage: POST with {"admin_key": "...", "email": "user@example.com", "days": 365}
+    """
+    data      = request.get_json() or {}
+    admin_key = data.get("admin_key", "")
+
+    # Use SECRET_KEY as admin password — only you know it
+    if admin_key != app.config["SECRET_KEY"]:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    email    = data.get("email", "").strip().lower()
+    username = data.get("username", "").strip()
+    days     = data.get("days", 365)
+
+    user = None
+    if email:
+        user = User.query.filter(db.func.lower(User.email) == email).first()
+    elif username:
+        user = User.query.filter(db.func.lower(User.username) == db.func.lower(username)).first()
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    user.is_subscribed    = True
+    user.subscription_end = datetime.datetime.utcnow() + datetime.timedelta(days=days)
+    db.session.commit()
+
+    print(f"[ADMIN] Granted {days}-day subscription to {user.username} ({user.email})")
+    return jsonify({
+        "success": True,
+        "user": user.username,
+        "email": user.email,
+        "subscription_end": user.subscription_end.isoformat(),
+    })
 
 @app.route("/version")
 def get_version():
@@ -1235,7 +1340,8 @@ def signup():
     db.session.add(new_user)
     db.session.commit()
 
-    return jsonify({"success": True, "message": "Signup successful"}), 201
+    token = generate_token(new_user.id)
+    return jsonify({"success": True, "message": "Signup successful", "token": token}), 201
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -1255,9 +1361,11 @@ def login():
 
     family, member = get_user_family(user.id)
 
+    token = generate_token(user.id)
     return jsonify({
     "success": True,
     "message": "Login successful",
+    "token": token,
     "user": {
         "id":        user.id,
         "username":  user.username,
@@ -1276,6 +1384,7 @@ def login():
 # =============================================================================
  
 @app.route("/settings/update_profile", methods=["POST"])
+@require_auth
 def update_profile():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -1300,6 +1409,7 @@ def update_profile():
  
  
 @app.route("/settings/change_password", methods=["POST"])
+@require_auth
 def change_password():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -1318,6 +1428,7 @@ def change_password():
  
  
 @app.route("/settings/remove_bank", methods=["POST"])
+@require_auth
 def remove_bank():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -1348,6 +1459,7 @@ def remove_bank():
  
  
 @app.route("/settings/report_bug", methods=["POST"])
+@require_auth
 def report_bug():
     data = request.get_json() or {}
     # Log it to Render logs for now — can wire to email later
@@ -1356,6 +1468,7 @@ def report_bug():
  
  
 @app.route("/settings/delete_account", methods=["DELETE"])
+@require_auth
 def delete_account():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -1390,6 +1503,7 @@ def delete_account():
 # =============================================================================
 
 @app.route("/profile/upload_picture", methods=["POST"])
+@require_auth
 def upload_profile_picture():
     """Accept a base64-encoded JPEG image (max ~200 KB encoded)."""
     data    = request.get_json() or {}
@@ -1410,6 +1524,7 @@ def upload_profile_picture():
 
 
 @app.route("/profile/picture", methods=["GET"])
+@require_auth
 def get_profile_picture():
     user_id = request.args.get("user_id", "")
     user = find_user_by_id(user_id)
@@ -1419,6 +1534,7 @@ def get_profile_picture():
 
 
 @app.route("/profile/pictures", methods=["GET"])
+@require_auth
 def get_profile_pictures_bulk():
     """Return profile pictures for multiple user_ids at once (for family view)."""
     ids_raw = request.args.get("user_ids", "")
@@ -1435,6 +1551,7 @@ def get_profile_pictures_bulk():
  
  
 @app.route("/subscription/cancel", methods=["POST"])
+@require_auth
 def cancel_subscription():
     data    = request.get_json() or {}
     user_id = str(data.get("user_id", ""))
@@ -1458,6 +1575,7 @@ def cancel_subscription():
 PLAID_REDIRECT_URI = "https://evernest-swz9.onrender.com/plaid/oauth-return"
 
 @app.route("/plaid/create_link_token", methods=["POST"])
+@require_auth
 def create_link_token():
     try:
         data    = request.get_json() or {}
@@ -1493,6 +1611,7 @@ def create_link_token():
 
 
 @app.route("/plaid/exchange_token", methods=["POST"])
+@require_auth
 def exchange_token():
     try:
         data         = request.get_json() or {}
@@ -1523,6 +1642,7 @@ def exchange_token():
 
 
 @app.route("/plaid/accounts", methods=["GET"])
+@require_auth
 def get_accounts():
     try:
         user_id = request.args.get("user_id")
@@ -1563,6 +1683,7 @@ def get_accounts():
 
 
 @app.route("/plaid/balance", methods=["GET"])
+@require_auth
 def get_realtime_balance():
     """Fetch real-time balance data using /accounts/balance/get.
     Unlike /plaid/accounts which returns cached data, this makes a live
@@ -1597,6 +1718,7 @@ def get_realtime_balance():
 
 
 @app.route("/plaid/transactions", methods=["GET"])
+@require_auth
 def get_transactions():
     """Fetch transactions with proper pagination as required by Plaid."""
     try:
@@ -1674,6 +1796,7 @@ def get_transactions():
 
 
 @app.route("/plaid/transactions/refresh", methods=["POST"])
+@require_auth
 def refresh_transactions():
     """Force a refresh of transaction data from the bank.
     Plaid will send a TRANSACTIONS webhook when new data is available."""
@@ -1697,6 +1820,7 @@ def refresh_transactions():
 
 
 @app.route("/plaid/update_link_token", methods=["POST"])
+@require_auth
 def create_update_link_token():
     """Create a Link token in update mode for re-authentication.
     Used when ITEM_LOGIN_REQUIRED, PENDING_EXPIRATION, or PENDING_DISCONNECT occurs."""
@@ -1727,6 +1851,7 @@ def create_update_link_token():
 
 
 @app.route("/plaid/reauth_complete", methods=["POST"])
+@require_auth
 def plaid_reauth_complete():
     """Called after user completes update mode Link flow. Clears the reauth flag."""
     data    = request.get_json() or {}
@@ -1740,6 +1865,7 @@ def plaid_reauth_complete():
 
 
 @app.route("/plaid/new_accounts_link_token", methods=["POST"])
+@require_auth
 def create_new_accounts_link_token():
     """Create a Link token in update mode with account_selection_enabled.
     Used when NEW_ACCOUNTS_AVAILABLE webhook fires — lets user add new accounts."""
@@ -1773,6 +1899,7 @@ def create_new_accounts_link_token():
 
 
 @app.route("/plaid/new_accounts_complete", methods=["POST"])
+@require_auth
 def plaid_new_accounts_complete():
     """Called after user completes the account selection flow. Clears the flag."""
     data    = request.get_json() or {}
@@ -1786,6 +1913,7 @@ def plaid_new_accounts_complete():
 
 
 @app.route("/plaid/status", methods=["GET"])
+@require_auth
 def plaid_connection_status():
     """Check if the user's bank connection needs re-authentication or has new accounts."""
     user_id = request.args.get("user_id", "")
