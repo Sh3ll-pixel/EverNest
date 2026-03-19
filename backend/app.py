@@ -54,6 +54,8 @@ class User(db.Model):
     email         = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     plaid_access_token = db.Column(db.String(255), nullable=True)
+    plaid_item_id      = db.Column(db.String(255), nullable=True)
+    plaid_reauth_required = db.Column(db.Boolean, default=False)
     is_subscribed          = db.Column(db.Boolean, default=False)
     subscription_end       = db.Column(db.DateTime, nullable=True)
     stripe_customer_id     = db.Column(db.String(100), nullable=True)
@@ -1423,6 +1425,8 @@ def cancel_subscription():
     return jsonify({"success": True})
 
 # ── Plaid routes ──────────────────────────────────────────────────────────────
+PLAID_REDIRECT_URI = "https://evernest-swz9.onrender.com/plaid/oauth-return"
+
 @app.route("/plaid/create_link_token", methods=["POST"])
 def create_link_token():
     try:
@@ -1436,6 +1440,7 @@ def create_link_token():
             country_codes=[CountryCode("US")],
             language="en",
             webhook="https://evernest-swz9.onrender.com/plaid/webhook",
+            redirect_uri=PLAID_REDIRECT_URI,
         )
         response   = plaid_client.link_token_create(req)
         link_token = response["link_token"]
@@ -1458,10 +1463,13 @@ def exchange_token():
         req          = ItemPublicTokenExchangeRequest(public_token=public_token)
         response     = plaid_client.item_public_token_exchange(req)
         access_token = response["access_token"]
+        item_id      = response["item_id"]
 
         user = find_user_by_id(user_id)
         if user:
-            user.plaid_access_token = access_token
+            user.plaid_access_token    = access_token
+            user.plaid_item_id         = item_id
+            user.plaid_reauth_required = False
             db.session.commit()
 
         return jsonify({"success": True})
@@ -1638,7 +1646,7 @@ def refresh_transactions():
 @app.route("/plaid/update_link_token", methods=["POST"])
 def create_update_link_token():
     """Create a Link token in update mode for re-authentication.
-    Used when ITEM_LOGIN_REQUIRED error occurs."""
+    Used when ITEM_LOGIN_REQUIRED, PENDING_EXPIRATION, or PENDING_DISCONNECT occurs."""
     try:
         data    = request.get_json() or {}
         user_id = str(data.get("user_id", ""))
@@ -1653,6 +1661,7 @@ def create_update_link_token():
             country_codes=[CountryCode("US")],
             language="en",
             webhook="https://evernest-swz9.onrender.com/plaid/webhook",
+            redirect_uri=PLAID_REDIRECT_URI,
             access_token=user.plaid_access_token,
         )
         response   = plaid_client.link_token_create(req)
@@ -1662,6 +1671,32 @@ def create_update_link_token():
 
     except plaid.ApiException as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/plaid/reauth_complete", methods=["POST"])
+def plaid_reauth_complete():
+    """Called after user completes update mode Link flow. Clears the reauth flag."""
+    data    = request.get_json() or {}
+    user_id = str(data.get("user_id", ""))
+    user    = find_user_by_id(user_id)
+    if user:
+        user.plaid_reauth_required = False
+        db.session.commit()
+        print(f"[PLAID] Cleared reauth flag for user {user_id}")
+    return jsonify({"success": True})
+
+
+@app.route("/plaid/status", methods=["GET"])
+def plaid_connection_status():
+    """Check if the user's bank connection needs re-authentication."""
+    user_id = request.args.get("user_id", "")
+    user    = find_user_by_id(user_id)
+    if not user:
+        return jsonify({"connected": False, "reauth_required": False})
+    return jsonify({
+        "connected":       bool(user.plaid_access_token),
+        "reauth_required": bool(getattr(user, 'plaid_reauth_required', False)),
+    })
     
 @app.route("/plaid/link")
 def plaid_link_page():
@@ -1689,6 +1724,9 @@ def plaid_link_page():
             })
             .then(r => r.json())
             .then(data => {
+                // Store for OAuth return page
+                localStorage.setItem('evernest_link_token', data.link_token);
+                localStorage.setItem('evernest_link_user_id', userId);
                 const handler = Plaid.create({
                     token: data.link_token,
                     onSuccess: function(public_token, metadata) {
@@ -1700,6 +1738,8 @@ def plaid_link_page():
                         })
                         .then(r => r.json())
                         .then(() => {
+                            localStorage.removeItem('evernest_link_token');
+                            localStorage.removeItem('evernest_link_user_id');
                             document.getElementById("status").innerHTML =
                                 "<p style='color:#4CFF7A'>✓ Bank connected! Close this tab and click Refresh in EverNest.</p>";
                         });
@@ -1711,6 +1751,83 @@ def plaid_link_page():
                 });
                 handler.open();
             });
+        </script>
+    </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/plaid/oauth-return")
+def plaid_oauth_return():
+    """OAuth return page. After a user authenticates with their bank via OAuth,
+    the bank redirects back here. This page re-initializes Plaid Link to
+    complete the connection."""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Connecting Bank - EverNest</title>
+        <style>
+            body { font-family: Arial, sans-serif; background: #0c0e14; color: #8b9cf7;
+                   display: flex; justify-content: center; align-items: center;
+                   height: 100vh; margin: 0; }
+            #status { font-size: 18px; text-align: center; }
+            .spinner { font-size: 36px; animation: spin 1s linear infinite; display: inline-block; }
+            @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        </style>
+    </head>
+    <body>
+        <div id="status">
+            <div class="spinner">⟳</div>
+            <p>Completing bank connection...</p>
+        </div>
+        <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+        <script>
+            // Re-initialize Link with the same link_token to complete the OAuth flow.
+            // The link_token is stored in localStorage by the /plaid/link page.
+            const linkToken = localStorage.getItem('evernest_link_token');
+
+            if (linkToken) {
+                const handler = Plaid.create({
+                    token: linkToken,
+                    receivedRedirectUri: window.location.href,
+                    onSuccess: function(public_token, metadata) {
+                        document.getElementById("status").innerHTML =
+                            "<p>Linking account...</p>";
+                        // Get user_id from localStorage
+                        const userId = localStorage.getItem('evernest_link_user_id') || 'default_user';
+                        fetch("/plaid/exchange_token", {
+                            method: "POST",
+                            headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({public_token: public_token, user_id: userId})
+                        })
+                        .then(r => r.json())
+                        .then(() => {
+                            document.getElementById("status").innerHTML =
+                                "<p style='color:#4ade80'>✓ Bank connected!</p>" +
+                                "<p style='color:#6b7280; font-size:14px;'>Close this tab and click Refresh in EverNest.</p>";
+                            localStorage.removeItem('evernest_link_token');
+                            localStorage.removeItem('evernest_link_user_id');
+                        });
+                    },
+                    onExit: function(err) {
+                        if (err) {
+                            document.getElementById("status").innerHTML =
+                                "<p style='color:#f87171'>Connection failed.</p>" +
+                                "<p style='color:#6b7280; font-size:14px;'>Close this tab and try again.</p>";
+                        } else {
+                            document.getElementById("status").innerHTML =
+                                "<p>Cancelled. Close this tab and try again.</p>";
+                        }
+                    }
+                });
+                handler.open();
+            } else {
+                document.getElementById("status").innerHTML =
+                    "<p style='color:#f87171'>Session expired.</p>" +
+                    "<p style='color:#6b7280; font-size:14px;'>Close this tab and reconnect your bank from EverNest.</p>";
+            }
         </script>
     </body>
     </html>
@@ -1756,14 +1873,33 @@ def plaid_webhook():
                 print(f"[PLAID WEBHOOK] Item error: {error_code} for item {item_id}")
                 if error_code == "ITEM_LOGIN_REQUIRED":
                     print(f"[PLAID WEBHOOK] User needs to re-authenticate bank connection")
+                    # Flag user for re-authentication
+                    user = User.query.filter_by(plaid_item_id=item_id).first()
+                    if user:
+                        user.plaid_reauth_required = True
+                        db.session.commit()
+                        print(f"[PLAID WEBHOOK] Flagged user {user.id} for reauth")
 
             elif webhook_code == "PENDING_EXPIRATION":
                 print(f"[PLAID WEBHOOK] Access token expiring soon for item {item_id}")
+                # Flag user — they'll need to re-auth before it fully expires
+                user = User.query.filter_by(plaid_item_id=item_id).first()
+                if user:
+                    user.plaid_reauth_required = True
+                    db.session.commit()
+                    print(f"[PLAID WEBHOOK] Flagged user {user.id} for pending expiration")
+
+            elif webhook_code == "PENDING_DISCONNECT":
+                print(f"[PLAID WEBHOOK] Bank pending disconnect for item {item_id}")
+                # Flag user — bank is about to revoke access
+                user = User.query.filter_by(plaid_item_id=item_id).first()
+                if user:
+                    user.plaid_reauth_required = True
+                    db.session.commit()
+                    print(f"[PLAID WEBHOOK] Flagged user {user.id} for pending disconnect")
 
             elif webhook_code == "NEW_ACCOUNTS_AVAILABLE":
                 print(f"[PLAID WEBHOOK] New accounts available for item {item_id}")
-                # User has new accounts at their bank that can be linked.
-                # The app will pick these up next time it fetches accounts.
 
         return "", 200
 
@@ -1890,6 +2026,22 @@ def migrate_balance():
             """))
             conn.commit()
         return "Balance snapshot migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
+
+@app.route("/migrate_plaid")
+def migrate_plaid():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS plaid_item_id VARCHAR(255)"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS plaid_reauth_required BOOLEAN DEFAULT FALSE"
+            ))
+            conn.commit()
+        return "Plaid migration successful", 200
     except Exception as e:
         return str(e), 400
 
