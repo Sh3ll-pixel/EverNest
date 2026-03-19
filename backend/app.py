@@ -1847,7 +1847,9 @@ def plaid_webhook():
     - TRANSACTIONS.TRANSACTIONS_REMOVED: Transactions were deleted
     - ITEM.ERROR: Bank connection has an error (e.g. credentials expired)
     - ITEM.PENDING_EXPIRATION: Access token expiring soon
+    - ITEM.PENDING_DISCONNECT: Bank about to revoke access
     - ITEM.NEW_ACCOUNTS_AVAILABLE: New accounts detected on the linked Item
+    - ITEM.LOGIN_REPAIRED: User successfully re-authenticated
     """
     try:
         data = request.get_json() or {}
@@ -1900,6 +1902,15 @@ def plaid_webhook():
 
             elif webhook_code == "NEW_ACCOUNTS_AVAILABLE":
                 print(f"[PLAID WEBHOOK] New accounts available for item {item_id}")
+
+            elif webhook_code == "LOGIN_REPAIRED":
+                print(f"[PLAID WEBHOOK] Login repaired for item {item_id}")
+                # User successfully re-authenticated — clear the reauth flag
+                user = User.query.filter_by(plaid_item_id=item_id).first()
+                if user:
+                    user.plaid_reauth_required = False
+                    db.session.commit()
+                    print(f"[PLAID WEBHOOK] Cleared reauth flag for user {user.id}")
 
         return "", 200
 
