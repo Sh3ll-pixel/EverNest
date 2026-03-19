@@ -1483,9 +1483,12 @@ def create_link_token():
         )
         response   = plaid_client.link_token_create(req)
         link_token = response["link_token"]
+        request_id = response.get("request_id", "")
+        print(f"[PLAID] link_token_create | user={user_id} | request_id={request_id}")
         return jsonify({"link_token": link_token})
 
     except plaid.ApiException as e:
+        print(f"[PLAID] link_token_create FAILED | user={user_id} | error={e}")
         return jsonify({"error": str(e)}), 400
 
 
@@ -1503,6 +1506,8 @@ def exchange_token():
         response     = plaid_client.item_public_token_exchange(req)
         access_token = response["access_token"]
         item_id      = response["item_id"]
+        request_id   = response.get("request_id", "")
+        print(f"[PLAID] Token exchange | item_id={item_id} | request_id={request_id} | user={user_id}")
 
         user = find_user_by_id(user_id)
         if user:
@@ -1513,6 +1518,7 @@ def exchange_token():
 
         return jsonify({"success": True})
     except plaid.ApiException as e:
+        print(f"[PLAID] Token exchange FAILED | user={user_id} | error={e}")
         return jsonify({"error": str(e)}), 400
 
 
@@ -1541,13 +1547,15 @@ def get_accounts():
                     resp     = plaid_client.accounts_get(
                         AccountsGetRequest(access_token=u.plaid_access_token)
                     )
+                    request_id = resp.get("request_id", "")
                     accounts = [a.to_dict() for a in resp["accounts"]]
+                    print(f"[PLAID] accounts_get | user={uid} | accounts={len(accounts)} | request_id={request_id}")
                     # Tag each account with owner username
                     for acct in accounts:
                         acct["owner"] = u.username
                     all_accounts.extend(accounts)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[PLAID] accounts_get FAILED | user={uid} | error={e}")
  
         return jsonify({"accounts": all_accounts})
     except Exception as e:
@@ -1569,13 +1577,15 @@ def get_realtime_balance():
 
         req = AccountsBalanceGetRequest(access_token=user.plaid_access_token)
         response = plaid_client.accounts_balance_get(req)
+        request_id = response.get("request_id", "")
         accounts = [a.to_dict() for a in response["accounts"]]
+        account_ids = [a.get("account_id", "") for a in accounts]
 
         # Tag with owner
         for acct in accounts:
             acct["owner"] = user.username
 
-        print(f"[PLAID BALANCE] Fetched real-time balances for user {user_id}: {len(accounts)} accounts")
+        print(f"[PLAID] balance_get | user={user_id} | accounts={account_ids} | request_id={request_id}")
         return jsonify({"accounts": accounts})
 
     except plaid.ApiException as e:
@@ -1623,6 +1633,10 @@ def get_transactions():
 
             if total_transactions is None:
                 total_transactions = response["total_transactions"]
+                request_id = response.get("request_id", "")
+                item = response.get("item", {})
+                item_id = item.get("item_id", "") if isinstance(item, dict) else ""
+                print(f"[PLAID] transactions_get | user={user_id} | item_id={item_id} | total={total_transactions} | request_id={request_id}")
 
             offset += len(transactions)
 
