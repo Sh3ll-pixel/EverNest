@@ -1165,9 +1165,27 @@ except Exception as e:
 
 
 # ── Core routes ───────────────────────────────────────────────────────────────
+
+# Current app version — bump this when you push a new release
+APP_VERSION = "1.0.0"
+
 @app.route("/")
 def home():
     return "API running", 200
+
+@app.route("/version")
+def get_version():
+    """Returns current app version and download URLs for auto-updater."""
+    return jsonify({
+        "version": APP_VERSION,
+        "downloads": {
+            "windows": f"https://github.com/Sh3ll-pixel/EverNest/releases/download/v{APP_VERSION}/EverNest_Setup_v{APP_VERSION}.exe",
+            "mac":     f"https://github.com/Sh3ll-pixel/EverNest/releases/download/v{APP_VERSION}/EverNest_v{APP_VERSION}_mac.dmg",
+            "linux":   f"https://github.com/Sh3ll-pixel/EverNest/releases/download/v{APP_VERSION}/evernest_{APP_VERSION}_amd64.deb",
+        },
+        "required": False,  # Set True to force update (block app until updated)
+        "changelog": "",     # Optional: "Bug fixes and performance improvements"
+    })
 
 @app.route("/lookup")
 def lookup_user():
