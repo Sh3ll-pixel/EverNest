@@ -43,22 +43,94 @@ def _auth_headers():
     return headers
 
 
+def _api_request(method, path, params=None, json=None, timeout=10, retries=2):
+    """Core API request with retry logic and error handling.
+    
+    - Retries on network errors and 5xx server errors
+    - Detects 401 (expired token) and flags for re-login
+    - Returns response object on success, None on failure
+    """
+    url = f"{API_BASE}{path}"
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            if method == "GET":
+                resp = requests.get(url, params=params, headers=_auth_headers(), timeout=timeout)
+            elif method == "POST":
+                resp = requests.post(url, json=json, headers=_auth_headers(), timeout=timeout)
+            elif method == "PUT":
+                resp = requests.put(url, json=json, headers=_auth_headers(), timeout=timeout)
+            elif method == "DELETE":
+                resp = requests.delete(url, json=json, headers=_auth_headers(), timeout=timeout)
+            else:
+                return None
+
+            # Token expired — user needs to re-login
+            if resp.status_code == 401:
+                _auth_token["token"] = None
+                print(f"[API] 401 on {path} — token expired")
+                return resp
+
+            # Server error — retry
+            if resp.status_code >= 500 and attempt < retries:
+                print(f"[API] {resp.status_code} on {path} — retrying ({attempt + 1}/{retries})")
+                import time
+                time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+                continue
+
+            return resp
+
+        except requests.ConnectionError as e:
+            last_error = e
+            if attempt < retries:
+                print(f"[API] Connection error on {path} — retrying ({attempt + 1}/{retries})")
+                import time
+                time.sleep(1 * (attempt + 1))
+                continue
+        except requests.Timeout as e:
+            last_error = e
+            if attempt < retries:
+                print(f"[API] Timeout on {path} — retrying ({attempt + 1}/{retries})")
+                import time
+                time.sleep(1)
+                continue
+        except requests.RequestException as e:
+            last_error = e
+            break
+
+    print(f"[API] Failed {path} after {retries + 1} attempts: {last_error}")
+    return None
+
+
 def api_get(path, params=None, timeout=10):
-    """Make an authenticated GET request to the API."""
-    return requests.get(f"{API_BASE}{path}", params=params,
-                         headers=_auth_headers(), timeout=timeout)
+    """Make an authenticated GET request with retries."""
+    return _api_request("GET", path, params=params, timeout=timeout)
 
 
 def api_post(path, json=None, timeout=10):
-    """Make an authenticated POST request to the API."""
-    return requests.post(f"{API_BASE}{path}", json=json,
-                          headers=_auth_headers(), timeout=timeout)
+    """Make an authenticated POST request with retries."""
+    return _api_request("POST", path, json=json, timeout=timeout)
 
 
 def api_delete(path, json=None, timeout=10):
-    """Make an authenticated DELETE request to the API."""
-    return requests.delete(f"{API_BASE}{path}", json=json,
-                            headers=_auth_headers(), timeout=timeout)
+    """Make an authenticated DELETE request with retries."""
+    return _api_request("DELETE", path, json=json, timeout=timeout)
+
+
+def api_put(path, json=None, timeout=10):
+    """Make an authenticated PUT request with retries."""
+    return _api_request("PUT", path, json=json, timeout=timeout)
+
+
+def safe_json(resp, default=None):
+    """Safely parse JSON from a response. Returns default on failure."""
+    if resp is None:
+        return default if default is not None else {}
+    try:
+        return resp.json()
+    except (ValueError, AttributeError):
+        return default if default is not None else {}
 
 # Subscription cache
 _sub_cache = {"subscribed": False, "checked": False}
@@ -73,6 +145,29 @@ _accent = {"color": "#3b5bdb", "widgets": []}  # widgets = list of (widget, role
 # Notification tracking — global so it persists across tab switches
 # Stores tuples of (event_id, date_str) to allow recurring events on different days
 _notified_events = set()
+
+# Notification preference — persisted to file
+_notif_config_path = os.path.join(os.path.expanduser("~"), ".evernest_notif.txt")
+_notifications = {"enabled": True}
+
+def _load_notif_pref():
+    try:
+        if os.path.exists(_notif_config_path):
+            with open(_notif_config_path, "r") as f:
+                val = f.read().strip().lower()
+                _notifications["enabled"] = val != "false"
+    except Exception:
+        pass
+
+def _save_notif_pref(enabled):
+    _notifications["enabled"] = enabled
+    try:
+        with open(_notif_config_path, "w") as f:
+            f.write("true" if enabled else "false")
+    except Exception:
+        pass
+
+_load_notif_pref()
 
 def _load_accent_color():
     try:
@@ -320,8 +415,7 @@ def pick_and_upload_profile_picture(user_data, callback=None):
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
             user_id = user_data.get("id") or user_data.get("username", "")
-            resp = requests.post(
-                f"{API_BASE}/profile/upload_picture",
+            resp = api_post("/profile/upload_picture",
                 json={"user_id": user_id, "image": b64},
                 timeout=15
             )
@@ -348,8 +442,7 @@ def fetch_my_profile_picture(user_data, callback=None):
 
     def _do():
         try:
-            resp = requests.get(
-                f"{API_BASE}/profile/picture",
+            resp = api_get("/profile/picture",
                 params={"user_id": user_id}, timeout=8
             )
             if resp.ok:
@@ -753,51 +846,86 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
  
     sub_status_var = ctk.StringVar(value="Checking…")
     sub_end_var    = ctk.StringVar(value="")
- 
+    _sub_cancelled = {"value": False}
+
     def sub_status_widget(row):
         ctk.CTkLabel(row, textvariable=sub_status_var, fg_color="transparent",
                       text_color="#4CFF7A", font=ctk.CTkFont(size=13)).pack(side="left", padx=(0, 12))
         ctk.CTkLabel(row, textvariable=sub_end_var, fg_color="transparent",
                       text_color="#9A9A9A", font=ctk.CTkFont(size=12)).pack(side="left")
     setting_row("Status", sub_status_widget)
- 
+
     def sub_actions_widget(row):
-        ctk.CTkButton(row, text="Manage Subscription", width=160, height=32,
+        nonlocal manage_btn, cancel_btn, resubscribe_btn
+        manage_btn = ctk.CTkButton(row, text="Manage Subscription", width=160, height=32,
                        fg_color="#252830", hover_color="#2b4bc8",
                        text_color="#7B93DB", corner_radius=8,
-                       command=lambda: switch_tab_fn("Subscribe") if switch_tab_fn else None
-                       ).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(row, text="Cancel Subscription", width=160, height=32,
+                       command=lambda: switch_tab_fn("Subscribe") if switch_tab_fn else None)
+        manage_btn.pack(side="left", padx=(0, 8))
+
+        cancel_btn = ctk.CTkButton(row, text="Cancel Subscription", width=160, height=32,
                        fg_color="transparent", hover_color="#2a1520",
                        text_color="#ff6b6b", corner_radius=8,
                        border_width=1, border_color="#ff6b6b",
-                       command=lambda: cancel_subscription()
-                       ).pack(side="left")
+                       command=lambda: cancel_subscription())
+        cancel_btn.pack(side="left")
+
+        resubscribe_btn = ctk.CTkButton(row, text="Resubscribe", width=140, height=32,
+                       fg_color=_accent["color"], hover_color="#2b4bc8",
+                       text_color="#ffffff", corner_radius=8,
+                       font=ctk.CTkFont(weight="bold"),
+                       command=lambda: switch_tab_fn("Subscribe") if switch_tab_fn else None)
+        # Hidden by default — shown only when cancelled
+
+    manage_btn = None
+    cancel_btn = None
+    resubscribe_btn = None
     setting_row("Manage", sub_actions_widget)
- 
+
     def load_sub_status():
         def _do():
             try:
                 resp = api_get("/subscription/status",
                                      params={"user_id": user_id}, timeout=6)
-                if resp.ok:
+                if resp and resp.ok:
                     data = resp.json()
-                    if data.get("subscribed"):
-                        end = (data.get("subscription_end") or "")[:10]
-                        parent.after(0, lambda: [
-                            sub_status_var.set("✓  Active"),
-                            sub_end_var.set(f"Renews {end}" if end else "")
-                        ])
-                    else:
-                        parent.after(0, lambda: [
-                            sub_status_var.set("Not subscribed"),
-                            sub_status_lbl_ref[0].configure(text_color="#9A9A9A")
-                            if sub_status_lbl_ref else None
-                        ])
+                    subscribed  = data.get("subscribed", False)
+                    end_str     = (data.get("subscription_end") or "")[:10]
+                    cancelled   = data.get("cancel_at_period_end", False)
+                    _sub_cancelled["value"] = cancelled
+
+                    def _update():
+                        if subscribed and cancelled:
+                            # Active but will not renew
+                            sub_status_var.set("⚠️  Cancelled")
+                            sub_end_var.set(f"Access ends {end_str}" if end_str else "")
+                            # Swap to yellow warning color
+                            for w in parent.winfo_children():
+                                pass  # Can't easily re-color the StringVar label
+                            if cancel_btn:
+                                cancel_btn.pack_forget()
+                            if resubscribe_btn:
+                                resubscribe_btn.pack(side="left")
+                        elif subscribed:
+                            sub_status_var.set("✓  Active")
+                            sub_end_var.set(f"Renews {end_str}" if end_str else "")
+                            if resubscribe_btn:
+                                resubscribe_btn.pack_forget()
+                            if cancel_btn:
+                                cancel_btn.pack(side="left")
+                        else:
+                            sub_status_var.set("Not subscribed")
+                            sub_end_var.set("")
+                            if cancel_btn:
+                                cancel_btn.pack_forget()
+                            if resubscribe_btn:
+                                resubscribe_btn.pack_forget()
+
+                    parent.after(0, _update)
             except Exception:
                 parent.after(0, lambda: sub_status_var.set("Unavailable"))
         threading.Thread(target=_do, daemon=True).start()
- 
+
     sub_status_lbl_ref = [None]
     load_sub_status()
  
@@ -806,9 +934,9 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
             try:
                 resp = api_post("/subscription/cancel",
                                       json={"user_id": user_id}, timeout=10)
-                if resp.ok:
+                if resp and resp.ok:
                     parent.after(0, lambda: [
-                        status_var.set("Subscription cancelled. Access ends at period end."),
+                        status_var.set("Subscription cancelled. Access continues until end of billing period."),
                         status_lbl.configure(text_color="#FFD700"),
                         load_sub_status()
                     ])
@@ -939,12 +1067,15 @@ def render_settings_tab(parent, user_data=None, switch_tab_fn=None):
     section_header("🔔  Notifications")
  
     def notif_widget(row):
-        var = ctk.BooleanVar(value=True)
+        var = ctk.BooleanVar(value=_notifications["enabled"])
+        def on_toggle():
+            _save_notif_pref(var.get())
         ctk.CTkSwitch(row, text="Enable popup reminders for calendar events",
                        variable=var, fg_color="#252830",
                        progress_color="#3b5bdb",
                        text_color="#d1d5db",
-                       font=ctk.CTkFont(size=13)).pack(side="left", padx=8, pady=10)
+                       font=ctk.CTkFont(size=13),
+                       command=on_toggle).pack(side="left", padx=8, pady=10)
     setting_row("Reminders", notif_widget)
  
     # =========================================================================
@@ -2095,8 +2226,8 @@ def render_financial_tab(parent, user_data=None, switch_tab_fn=None):
                                       command=lambda: [
                                           dismiss_new_acct_banner(),
                                           # Also clear the server flag so it doesn't come back
-                                          threading.Thread(target=lambda: requests.post(
-                                              f"{API_BASE}/plaid/new_accounts_complete",
+                                          threading.Thread(target=lambda: api_post(
+                                              "/plaid/new_accounts_complete",
                                               json={"user_id": user_id}, timeout=6),
                                               daemon=True).start(),
                                       ])
@@ -2361,9 +2492,11 @@ PAYDAY_OPTIONS = ["Weekly", "Bi-Weekly", "Semi-Monthly", "Monthly"]
 
 
 def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
-    # Check subscription — always re-verify from API unless already confirmed
+    import tkinter as tk
+
+    # Check subscription
     if _sub_cache["checked"] and _sub_cache["subscribed"]:
-        pass  # confirmed subscriber, proceed
+        pass
     else:
         def _check_sub():
             subscribed = check_subscription(user_data, force=True)
@@ -2375,123 +2508,152 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
     if user_data:
         user_id = str(user_data.get("id") or user_data.get("username", ""))
 
-    # ── Top header ────────────────────────────────────────────────────────────
+    accent = _accent["color"]
+
+    # ── Header ────────────────────────────────────────────────────────────────
     ctk.CTkLabel(parent, text="Budget Planner", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=24, weight="bold")).place(x=30, y=18)
-    ctk.CTkLabel(parent, text="Set your budget — we'll track it automatically from your bank.",
-                 fg_color="transparent", text_color="#5B8DEF",
-                 font=ctk.CTkFont(size=13)).place(x=30, y=52)
+                 text_color="#e5e7eb", font=ctk.CTkFont(size=22, weight="bold")).place(x=32, y=16)
+    ctk.CTkLabel(parent, text="Track income, spending categories, and fixed bills",
+                 fg_color="transparent", text_color="#4b5563",
+                 font=ctk.CTkFont(size=12)).place(x=32, y=44)
+
+    # Accent line under header
+    ctk.CTkFrame(parent, fg_color=accent, width=180, height=2, corner_radius=1).place(x=32, y=66)
 
     status_var = ctk.StringVar(value="")
     status_lbl = ctk.CTkLabel(parent, textvariable=status_var, fg_color="transparent",
-                               text_color="#4CFF7A", font=ctk.CTkFont(size=11), width=400)
-    status_lbl.place(x=30, y=652)
+                               text_color="#4ade80", font=ctk.CTkFont(size=11), width=400)
+    status_lbl.place(x=32, y=652)
 
-    # ── Summary bar (top row of cards) ────────────────────────────────────────
-    summary_frame = ctk.CTkFrame(parent, fg_color="transparent", width=860, height=72)
-    summary_frame.place(x=30, y=78)
+    # Refresh button
+    ctk.CTkButton(parent, text="⟳  Refresh", width=110, height=30,
+                   fg_color="#161a1f", hover_color="#1f2328",
+                   text_color=accent, corner_radius=8,
+                   border_width=1, border_color="#2a2f38",
+                   font=ctk.CTkFont(size=12),
+                   command=lambda: fetch_actuals()).place(x=760, y=18)
 
+    # ── Summary cards ─────────────────────────────────────────────────────────
     summary_labels = {}
-    summary_cards  = [
-        ("income_card",  "Monthly Income",  "—",      "#4CFF7A"),
-        ("spent_card",   "Spent This Month", "—",      "#FF6B6B"),
-        ("budget_card",  "Total Budgeted",   "—",      "#7B93DB"),
-        ("remain_card",  "Remaining",        "—",      "#FFD700"),
+    card_info = [
+        ("income_card",  "Monthly Income",   "—", "#4ade80"),
+        ("spent_card",   "Spent This Month", "—", "#f87171"),
+        ("budget_card",  "Total Budgeted",   "—", accent),
+        ("remain_card",  "Remaining",        "—", "#fbbf24"),
     ]
-    sx = 0
-    for key, title, val, color in summary_cards:
-        card = ctk.CTkFrame(summary_frame, fg_color="#1f2328", width=204, height=68, corner_radius=8)
-        card.place(x=sx, y=0)
-        ctk.CTkLabel(card, text=title, fg_color="transparent", text_color="#9A9A9A",
-                     font=ctk.CTkFont(size=11)).place(x=12, y=8)
-        lbl = ctk.CTkLabel(card, text=val, fg_color="transparent", text_color=color,
-                            font=ctk.CTkFont(size=18, weight="bold"))
-        lbl.place(x=12, y=30)
-        summary_labels[key] = lbl
-        sx += 216
+    cx = 32
+    for key, title, val, color in card_info:
+        card = ctk.CTkFrame(parent, fg_color="#161a1f", width=200, height=74,
+                             corner_radius=10, border_width=1, border_color="#2a2f38")
+        card.place(x=cx, y=78)
 
-    # ── Left panel: Budget Setup ───────────────────────────────────────────────
-    left_panel = ctk.CTkScrollableFrame(parent, fg_color="#1f2328",
-                                         width=360, height=490, corner_radius=8)
-    left_panel.place(x=30, y=158)
+        ctk.CTkLabel(card, text=title, fg_color="transparent", text_color="#6b7280",
+                     font=ctk.CTkFont(size=10)).place(x=14, y=10)
+
+        lbl = ctk.CTkLabel(card, text=val, fg_color="transparent", text_color=color,
+                            font=ctk.CTkFont(size=20, weight="bold"))
+        lbl.place(x=14, y=34)
+        summary_labels[key] = lbl
+
+        # Subtle top accent bar
+        ctk.CTkFrame(card, fg_color=color, width=40, height=2,
+                      corner_radius=1).place(x=14, y=66)
+        cx += 212
+
+    # ── Left panel: Budget Setup ──────────────────────────────────────────────
+    left_panel = ctk.CTkScrollableFrame(parent, fg_color="#161a1f",
+                                         width=358, height=472, corner_radius=10,
+                                         border_width=1, border_color="#2a2f38")
+    left_panel.place(x=32, y=166)
 
     ctk.CTkLabel(left_panel, text="Budget Setup", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=15, weight="bold")).pack(
+                 text_color="#e5e7eb", font=ctk.CTkFont(size=15, weight="bold")).pack(
                  anchor="w", padx=16, pady=(14, 2))
-    ctk.CTkFrame(left_panel, fg_color="#2a2f38", height=1).pack(fill="x", padx=16, pady=(0, 10))
+    ctk.CTkFrame(left_panel, fg_color=accent, width=60, height=2,
+                  corner_radius=1).pack(anchor="w", padx=16, pady=(2, 12))
 
     # Income
-    ctk.CTkLabel(left_panel, text="Monthly Income ($)", fg_color="transparent",
-                 text_color="#9A9A9A", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16)
-    income_entry = ctk.CTkEntry(left_panel, placeholder_text="e.g. 4500",
-                                 fg_color="#363C45", width=328, height=34,
-                                 text_color="#7B93DB", corner_radius=8,
-                                 border_width=1, border_color="#2a2f38")
+    ctk.CTkLabel(left_panel, text="Monthly Income", fg_color="transparent",
+                 text_color="#6b7280", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16)
+    income_entry = ctk.CTkEntry(left_panel, placeholder_text="e.g. $4,500",
+                                 fg_color="#0c0e14", width=328, height=36,
+                                 text_color="#e5e7eb", corner_radius=8,
+                                 border_width=1, border_color="#2a2f38",
+                                 placeholder_text_color="#3d4456")
     income_entry.pack(anchor="w", padx=16, pady=(2, 10))
 
-    # Payday
+    # Pay frequency
     ctk.CTkLabel(left_panel, text="Pay Frequency", fg_color="transparent",
-                 text_color="#9A9A9A", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16)
+                 text_color="#6b7280", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16)
     payday_var  = ctk.StringVar(value="Bi-Weekly")
     payday_menu = ctk.CTkOptionMenu(left_panel, values=PAYDAY_OPTIONS, variable=payday_var,
-                                     fg_color="#363C45", width=328, height=34,
-                                     text_color="#7B93DB", button_color="#2a2f38",
-                                     button_hover_color="#2b4bc8", corner_radius=8)
+                                     fg_color="#0c0e14", width=328, height=36,
+                                     text_color="#e5e7eb", button_color="#2a2f38",
+                                     button_hover_color=accent, corner_radius=8,
+                                     dropdown_fg_color="#161a1f",
+                                     dropdown_text_color="#e5e7eb",
+                                     dropdown_hover_color="#1f2328")
     payday_menu.pack(anchor="w", padx=16, pady=(2, 10))
 
     # Next payday
-    ctk.CTkLabel(left_panel, text="Next Payday (YYYY-MM-DD)", fg_color="transparent",
-                 text_color="#9A9A9A", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=16)
-    payday_entry = ctk.CTkEntry(left_panel, placeholder_text="e.g. 2026-03-28",
-                                 fg_color="#363C45", width=328, height=34,
-                                 text_color="#7B93DB", corner_radius=8,
-                                 border_width=1, border_color="#2a2f38")
+    ctk.CTkLabel(left_panel, text="Next Payday", fg_color="transparent",
+                 text_color="#6b7280", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=16)
+    payday_entry = ctk.CTkEntry(left_panel, placeholder_text="YYYY-MM-DD",
+                                 fg_color="#0c0e14", width=328, height=36,
+                                 text_color="#e5e7eb", corner_radius=8,
+                                 border_width=1, border_color="#2a2f38",
+                                 placeholder_text_color="#3d4456")
     payday_entry.pack(anchor="w", padx=16, pady=(2, 14))
 
-    # Divider
+    # Categories header
     ctk.CTkLabel(left_panel, text="Spending Categories", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).pack(
-                 anchor="w", padx=16, pady=(0, 4))
-    ctk.CTkFrame(left_panel, fg_color="#2a2f38", height=1).pack(fill="x", padx=16, pady=(0, 8))
+                 text_color="#e5e7eb", font=ctk.CTkFont(size=13, weight="bold")).pack(
+                 anchor="w", padx=16, pady=(4, 2))
+    ctk.CTkFrame(left_panel, fg_color=accent, width=60, height=2,
+                  corner_radius=1).pack(anchor="w", padx=16, pady=(2, 10))
 
-    # Category budget entries
     cat_entries = {}
     for cat in BUDGET_CATEGORIES:
-        row = ctk.CTkFrame(left_panel, fg_color="transparent")
+        row = ctk.CTkFrame(left_panel, fg_color="transparent", height=34)
         row.pack(fill="x", padx=16, pady=2)
+        row.pack_propagate(False)
         ctk.CTkLabel(row, text=cat, fg_color="transparent", text_color="#d1d5db",
                      font=ctk.CTkFont(size=12), width=170, anchor="w").pack(side="left")
         ent = ctk.CTkEntry(row, placeholder_text="$0",
-                            fg_color="#363C45", width=140, height=30,
-                            text_color="#7B93DB", corner_radius=8,
-                            border_width=1, border_color="#2a2f38")
+                            fg_color="#0c0e14", width=140, height=32,
+                            text_color="#e5e7eb", corner_radius=8,
+                            border_width=1, border_color="#2a2f38",
+                            placeholder_text_color="#3d4456")
         ent.pack(side="right")
         cat_entries[cat] = ent
 
-    # Bills section
-    ctk.CTkFrame(left_panel, fg_color="#2a2f38", height=1).pack(fill="x", padx=16, pady=(12, 6))
+    # Bills header
+    ctk.CTkFrame(left_panel, fg_color="#2a2f38", height=1).pack(fill="x", padx=16, pady=(14, 6))
     ctk.CTkLabel(left_panel, text="Fixed Bills", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=13, weight="bold")).pack(
-                 anchor="w", padx=16, pady=(0, 6))
+                 text_color="#e5e7eb", font=ctk.CTkFont(size=13, weight="bold")).pack(
+                 anchor="w", padx=16, pady=(0, 2))
+    ctk.CTkFrame(left_panel, fg_color=accent, width=40, height=2,
+                  corner_radius=1).pack(anchor="w", padx=16, pady=(2, 8))
 
     bills_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
     bills_frame.pack(fill="x", padx=16, pady=(0, 4))
-    bills_rows  = []   # list of (name_entry, amount_entry, frame)
+    bills_rows = []
 
     def add_bill_row(name="", amount=""):
-        row = ctk.CTkFrame(bills_frame, fg_color="#363C45", corner_radius=8)
+        row = ctk.CTkFrame(bills_frame, fg_color="#0c0e14", corner_radius=8,
+                            border_width=1, border_color="#2a2f38")
         row.pack(fill="x", pady=3)
         name_ent = ctk.CTkEntry(row, placeholder_text="Bill name",
-                                 fg_color="#1f2328", width=170, height=28,
-                                 text_color="#7B93DB", corner_radius=4,
-                                 border_width=0)
-        name_ent.pack(side="left", padx=(8, 4), pady=6)
+                                 fg_color="transparent", width=168, height=30,
+                                 text_color="#e5e7eb", corner_radius=4,
+                                 border_width=0, placeholder_text_color="#3d4456")
+        name_ent.pack(side="left", padx=(10, 4), pady=6)
         if name:
             name_ent.insert(0, name)
         amt_ent = ctk.CTkEntry(row, placeholder_text="$0",
-                                fg_color="#1f2328", width=90, height=28,
-                                text_color="#7B93DB", corner_radius=4,
-                                border_width=0)
+                                fg_color="transparent", width=90, height=30,
+                                text_color="#e5e7eb", corner_radius=4,
+                                border_width=0, placeholder_text_color="#3d4456")
         amt_ent.pack(side="left", padx=(0, 4), pady=6)
         if amount:
             amt_ent.insert(0, str(amount))
@@ -2501,43 +2663,45 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
             row.destroy()
 
         ctk.CTkButton(row, text="✕", width=24, height=24, fg_color="transparent",
-                       hover_color="#2a1520", text_color="#ff6b6b", corner_radius=4,
+                       hover_color="#2a1520", text_color="#f87171", corner_radius=4,
+                       font=ctk.CTkFont(size=12),
                        command=remove).pack(side="right", padx=6)
         bills_rows.append((name_ent, amt_ent, row))
 
-    ctk.CTkButton(left_panel, text="＋  Add Bill", width=160, height=28,
-                   fg_color="#252830", hover_color="#2b4bc8",
-                   text_color="#7B93DB", corner_radius=8,
-                   command=add_bill_row).pack(anchor="w", padx=16, pady=(4, 14))
+    ctk.CTkButton(left_panel, text="＋  Add Bill", width=160, height=30,
+                   fg_color="#0c0e14", hover_color="#1f2328",
+                   text_color=accent, corner_radius=8,
+                   border_width=1, border_color="#2a2f38",
+                   font=ctk.CTkFont(size=12),
+                   command=add_bill_row).pack(anchor="w", padx=16, pady=(6, 14))
 
     # Save button
-    save_btn = ctk.CTkButton(left_panel, text="💾  Save Budget", width=328, height=36,
-                              fg_color="#3b5bdb", hover_color="#2b4bc8",
-                              text_color="#f0f1f3", corner_radius=8,
+    save_btn = ctk.CTkButton(left_panel, text="💾  Save Budget", width=328, height=38,
+                              fg_color=accent, hover_color="#2b4bc8",
+                              text_color="#ffffff", corner_radius=8,
+                              font=ctk.CTkFont(size=13, weight="bold"),
                               command=lambda: save_budget())
     save_btn.pack(anchor="w", padx=16, pady=(0, 16))
 
     # ── Right panel: Spending Tracker ─────────────────────────────────────────
-    right_panel = ctk.CTkScrollableFrame(parent, fg_color="#1f2328",
-                                          width=448, height=490, corner_radius=8)
-    right_panel.place(x=408, y=158)
+    right_panel = ctk.CTkScrollableFrame(parent, fg_color="#161a1f",
+                                          width=448, height=472, corner_radius=10,
+                                          border_width=1, border_color="#2a2f38")
+    right_panel.place(x=408, y=166)
 
     ctk.CTkLabel(right_panel, text="This Month's Spending", fg_color="transparent",
-                 text_color="#7B93DB", font=ctk.CTkFont(size=15, weight="bold")).pack(
+                 text_color="#e5e7eb", font=ctk.CTkFont(size=15, weight="bold")).pack(
                  anchor="w", padx=16, pady=(14, 2))
-    ctk.CTkFrame(right_panel, fg_color="#2a2f38", height=1).pack(fill="x", padx=16, pady=(0, 10))
+    ctk.CTkFrame(right_panel, fg_color=accent, width=80, height=2,
+                  corner_radius=1).pack(anchor="w", padx=16, pady=(2, 12))
 
     spending_inner = ctk.CTkFrame(right_panel, fg_color="transparent")
     spending_inner.pack(fill="both", expand=True, padx=8)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── State ─────────────────────────────────────────────────────────────────
     budget_state = {
-        "income":      0,
-        "payday_freq": "Bi-Weekly",
-        "next_payday": "",
-        "categories":  {},   # cat -> budgeted amount
-        "bills":       [],   # [{name, amount}]
-        "actuals":     {},   # cat -> actual spent
+        "income": 0, "payday_freq": "Bi-Weekly", "next_payday": "",
+        "categories": {}, "bills": [], "actuals": {},
     }
 
     def map_plaid_category(plaid_cats):
@@ -2547,16 +2711,16 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
         return "Other"
 
     def update_summary():
-        income     = budget_state["income"]
-        total_bud  = sum(budget_state["categories"].values())
-        total_bud += sum(b["amount"] for b in budget_state["bills"])
+        income      = budget_state["income"]
+        total_bud   = sum(budget_state["categories"].values())
+        total_bud  += sum(b["amount"] for b in budget_state["bills"])
         total_spent = sum(budget_state["actuals"].values())
         remaining   = income - total_spent
 
         summary_labels["income_card"].configure(text=f"${income:,.0f}")
         summary_labels["budget_card"].configure(text=f"${total_bud:,.0f}")
         summary_labels["spent_card"].configure(text=f"${total_spent:,.0f}")
-        rem_color = "#4CFF7A" if remaining >= 0 else "#FF6B6B"
+        rem_color = "#4ade80" if remaining >= 0 else "#f87171"
         summary_labels["remain_card"].configure(text=f"${remaining:,.0f}", text_color=rem_color)
 
     def render_spending():
@@ -2564,62 +2728,66 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
             w.destroy()
 
         all_cats = list(budget_state["categories"].keys())
-        # Also show any actuals categories not in budget
         for cat in budget_state["actuals"]:
             if cat not in all_cats:
                 all_cats.append(cat)
 
         if not all_cats and not budget_state["bills"]:
-            ctk.CTkLabel(spending_inner, text="Save a budget to see your spending breakdown.",
-                          fg_color="transparent", text_color="#4b5060",
-                          font=ctk.CTkFont(size=13)).pack(anchor="w", padx=10, pady=16)
+            ctk.CTkLabel(spending_inner, text="Save a budget to see your\nspending breakdown here.",
+                          fg_color="transparent", text_color="#3d4456",
+                          font=ctk.CTkFont(size=13), justify="center").pack(pady=40)
             return
 
-        # Category rows
         for cat in all_cats:
             budgeted = budget_state["categories"].get(cat, 0)
             actual   = budget_state["actuals"].get(cat, 0)
             pct      = min((actual / budgeted * 100) if budgeted > 0 else 100, 100)
             over     = actual > budgeted and budgeted > 0
 
-            row = ctk.CTkFrame(spending_inner, fg_color="#363C45", corner_radius=8)
-            row.pack(fill="x", pady=4, padx=2)
+            row = ctk.CTkFrame(spending_inner, fg_color="#0c0e14", corner_radius=8,
+                                border_width=1, border_color="#1f2328")
+            row.pack(fill="x", pady=3, padx=2)
 
             top = ctk.CTkFrame(row, fg_color="transparent")
-            top.pack(fill="x", padx=12, pady=(8, 2))
-            ctk.CTkLabel(top, text=cat, fg_color="transparent", text_color="#d1d5db",
+            top.pack(fill="x", padx=14, pady=(10, 2))
+            ctk.CTkLabel(top, text=cat, fg_color="transparent", text_color="#e5e7eb",
                           font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
-            amt_color = "#FF6B6B" if over else "#4CFF7A"
+            amt_color = "#f87171" if over else "#4ade80"
+            pct_text = f"{pct:.0f}%"
+            ctk.CTkLabel(top, text=pct_text, fg_color="transparent", text_color=amt_color,
+                          font=ctk.CTkFont(size=11, weight="bold")).pack(side="right")
             ctk.CTkLabel(top, text=f"${actual:,.0f} / ${budgeted:,.0f}",
-                          fg_color="transparent", text_color=amt_color,
-                          font=ctk.CTkFont(size=12)).pack(side="right")
+                          fg_color="transparent", text_color="#6b7280",
+                          font=ctk.CTkFont(size=11)).pack(side="right", padx=(0, 8))
 
             # Progress bar
-            bar_bg = ctk.CTkFrame(row, fg_color="#1f2328", width=410, height=8, corner_radius=4)
-            bar_bg.pack(padx=12, pady=(2, 8))
-            bar_fill_w = max(int(410 * pct / 100), 0)
+            bar_bg = ctk.CTkFrame(row, fg_color="#1f2328", width=404, height=6, corner_radius=3)
+            bar_bg.pack(padx=14, pady=(2, 10))
+            bar_fill_w = max(int(404 * pct / 100), 0)
             if bar_fill_w > 0:
-                bar_color = "#FF6B6B" if over else "#3b5bdb"
+                bar_color = "#f87171" if over else accent
                 ctk.CTkFrame(bar_bg, fg_color=bar_color,
-                              width=bar_fill_w, height=8, corner_radius=4).place(x=0, y=0)
+                              width=min(bar_fill_w, 404), height=6,
+                              corner_radius=3).place(x=0, y=0)
 
         # Fixed bills
         if budget_state["bills"]:
             ctk.CTkFrame(spending_inner, fg_color="#2a2f38", height=1).pack(
-                fill="x", padx=8, pady=(8, 4))
+                fill="x", padx=4, pady=(10, 4))
             ctk.CTkLabel(spending_inner, text="Fixed Bills", fg_color="transparent",
-                          text_color="#7B93DB", font=ctk.CTkFont(size=12, weight="bold")).pack(
+                          text_color="#e5e7eb", font=ctk.CTkFont(size=12, weight="bold")).pack(
                           anchor="w", padx=10, pady=(0, 4))
             for bill in budget_state["bills"]:
-                brow = ctk.CTkFrame(spending_inner, fg_color="#363C45", corner_radius=8)
+                brow = ctk.CTkFrame(spending_inner, fg_color="#0c0e14", corner_radius=8,
+                                     border_width=1, border_color="#1f2328")
                 brow.pack(fill="x", pady=3, padx=2)
                 ctk.CTkLabel(brow, text=bill["name"], fg_color="transparent",
                               text_color="#d1d5db", font=ctk.CTkFont(size=12)).pack(
-                              side="left", padx=12, pady=8)
+                              side="left", padx=14, pady=10)
                 ctk.CTkLabel(brow, text=f"${bill['amount']:,.0f}/mo",
-                              fg_color="transparent", text_color="#FF6B6B",
+                              fg_color="transparent", text_color="#f87171",
                               font=ctk.CTkFont(size=12, weight="bold")).pack(
-                              side="right", padx=12)
+                              side="right", padx=14)
 
         update_summary()
 
@@ -2628,8 +2796,8 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
         def _do():
             try:
                 resp = api_get("/budget", params={"user_id": user_id}, timeout=10)
-                if resp.ok:
-                    data = resp.json().get("budget") or {}
+                if resp and resp.ok:
+                    data = safe_json(resp).get("budget") or {}
                     if data:
                         budget_state["income"]      = data.get("income", 0)
                         budget_state["payday_freq"] = data.get("payday_freq", "Bi-Weekly")
@@ -2653,7 +2821,6 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
             except Exception:
                 pass
             parent.after(0, fetch_actuals)
-
         threading.Thread(target=_do, daemon=True).start()
 
     def fetch_actuals():
@@ -2662,14 +2829,13 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
             try:
                 resp = api_get("/plaid/transactions",
                                      params={"user_id": user_id}, timeout=15)
-                if resp.ok:
-                    transactions = resp.json().get("transactions", [])
+                if resp and resp.ok:
+                    transactions = safe_json(resp).get("transactions", [])
                     actuals = {}
                     today   = datetime.date.today()
                     month_start = today.replace(day=1).isoformat()
 
                     for tx in transactions:
-                        # Only include debits (positive amount = money out in Plaid)
                         if tx.get("amount", 0) <= 0:
                             continue
                         tx_date = tx.get("date", "")
@@ -2683,10 +2849,10 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
 
                 def _update():
                     render_spending()
-                    status_var.set("✓  Up to date")
+                    status_var.set("")
                 parent.after(0, _update)
             except Exception as e:
-                parent.after(0, lambda: status_var.set(f"Could not load transactions: {e}"))
+                parent.after(0, lambda: status_var.set(f"Could not load transactions"))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -2737,17 +2903,11 @@ def render_budget_tab(parent, user_data=None, switch_tab_fn=None):
                 parent.after(0, lambda: status_var.set("✓  Budget saved"))
                 parent.after(0, render_spending)
             except Exception as e:
-                parent.after(0, lambda: status_var.set(f"Save failed: {e}"))
+                parent.after(0, lambda: status_var.set(f"Save failed"))
             finally:
                 parent.after(0, lambda: save_btn.configure(state="normal"))
 
         threading.Thread(target=_do, daemon=True).start()
-
-    # Refresh button
-    ctk.CTkButton(parent, text="⟳  Refresh Spending", width=160, height=30,
-                   fg_color="#252830", hover_color="#2b4bc8",
-                   text_color="#7B93DB", corner_radius=8,
-                   command=fetch_actuals).place(x=696, y=18)
 
     load_budget()
 
@@ -3031,8 +3191,7 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
         status_var.set("Loading…")
         def _do():
             try:
-                resp = requests.get(
-                    f"{API_BASE}/calendar/events",
+                resp = api_get("/calendar/events",
                     params={"user_id": user_id, "year": state["year"], "month": state["month"]},
                     timeout=10
                 )
@@ -3261,13 +3420,11 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
             def _do():
                 try:
                     if is_edit:
-                        resp = requests.put(
-                            f"{API_BASE}/calendar/events/{edit_event['id']}",
+                        resp = api_put(f"/calendar/events/{edit_event['id']}",
                             json=payload, timeout=10
                         )
                     else:
-                        resp = requests.post(
-                            f"{API_BASE}/calendar/events",
+                        resp = api_post("/calendar/events",
                             json=payload, timeout=10
                         )
                     if resp.ok:
@@ -3305,6 +3462,9 @@ def render_calendar_tab(parent, user_data=None, app_window=None):
 
     def check_notifications():
         if not parent.winfo_exists():
+            return
+        if not _notifications["enabled"]:
+            parent.after(60000, check_notifications)
             return
         now = datetime.datetime.now()
         today_str = now.strftime("%Y-%m-%d")
@@ -3791,7 +3951,7 @@ def render_notes_tab(parent, user_data=None):
  
         def _do():
             try:
-                requests.put(f"{API_BASE}/notes/{state['active_id']}",
+                api_put(f"/notes/{state['active_id']}",
                               json=payload, timeout=10)
                 parent.after(0, load_notes)
                 if not silent:
@@ -4131,8 +4291,7 @@ def check_subscription(user_data, force=False):
         return False
     user_id = user_data.get("id") or user_data.get("username", "")
     try:
-        resp = requests.get(
-            f"{API_BASE}/subscription/status",
+        resp = api_get("/subscription/status",
             params={"user_id": user_id},
             timeout=6
         )
@@ -4332,8 +4491,7 @@ def render_subscribe_tab(parent, user_data=None):
         stripe_btn.configure(state="disabled", text="Opening checkout…")
         def _do():
             try:
-                resp = requests.post(
-                    f"{API_BASE}/subscription/stripe/create-session",
+                resp = api_post("/subscription/stripe/create-session",
                     json={"user_id": user_id}, timeout=15
                 )
                 data = resp.json()
@@ -4379,19 +4537,29 @@ def render_subscribe_tab(parent, user_data=None):
     def check_status():
         def _do():
             try:
-                resp = requests.get(
-                    f"{API_BASE}/subscription/status",
+                resp = api_get("/subscription/status",
                     params={"user_id": user_id}, timeout=6
                 )
-                if resp.ok:
+                if resp and resp.ok:
                     data = resp.json()
-                    if data.get("subscribed"):
-                        end  = data.get("subscription_end", "")[:10]
+                    subscribed = data.get("subscribed", False)
+                    cancelled  = data.get("cancel_at_period_end", False)
+                    end_str    = (data.get("subscription_end") or "")[:10]
+
+                    if subscribed and cancelled:
                         parent.after(0, lambda: status_var.set(
-                            f"✓  Active — renews {end}"))
+                            f"⚠️  Cancelled — access ends {end_str}"))
+                        parent.after(0, lambda: status_lbl.configure(text_color="#FFD700"))
+                        parent.after(0, lambda: stripe_btn.configure(
+                            text="🔄  Resubscribe", state="normal"))
+                        already_sub["value"] = True
+                        _sub_cache["subscribed"] = True
+                        _sub_cache["checked"]    = True
+                    elif subscribed:
+                        parent.after(0, lambda: status_var.set(
+                            f"✓  Active — renews {end_str}"))
                         parent.after(0, lambda: status_lbl.configure(text_color="#4CFF7A"))
                         already_sub["value"] = True
-                        # Update global cache so other tabs unlock immediately
                         _sub_cache["subscribed"] = True
                         _sub_cache["checked"]    = True
                     else:
@@ -4401,7 +4569,7 @@ def render_subscribe_tab(parent, user_data=None):
             except Exception:
                 parent.after(0, lambda: status_var.set("Could not check status."))
         threading.Thread(target=_do, daemon=True).start()
- 
+
     check_status()
 
 # =============================================================================
