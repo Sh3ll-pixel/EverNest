@@ -169,12 +169,9 @@ def subscription_status():
     user_id = request.args.get("user_id")
     user = find_user_by_id(user_id)
     if not user:
-        print(f"[SUB STATUS] User not found: {user_id}")
         return jsonify({"subscribed": False}), 404
 
-    print(f"[SUB STATUS] User {user_id}: is_subscribed={user.is_subscribed}, "
-          f"stripe_customer_id={user.stripe_customer_id}, "
-          f"subscription_end={user.subscription_end}")
+    cancel_at_period_end = False
 
     # Check if subscription_end has passed
     if user.is_subscribed and user.subscription_end:
@@ -182,20 +179,12 @@ def subscription_status():
             user.is_subscribed = False
             db.session.commit()
 
-    # If DB says not subscribed but user has a Stripe customer,
-    # check Stripe directly — covers cases where webhook/success page failed
-    if not user.is_subscribed and user.stripe_customer_id:
+    # Check Stripe for current state
+    if user.stripe_customer_id:
         try:
-            # Check ALL subscription statuses, not just "active"
             subs = stripe.Subscription.list(
-                customer=user.stripe_customer_id,
-                limit=5
+                customer=user.stripe_customer_id, limit=5
             )
-            print(f"[SUB STATUS] Stripe returned {len(subs.data)} subscriptions")
-            for s in subs.data:
-                print(f"[SUB STATUS]   -> id={s.id}, status={s.status}")
-
-            # Accept active, trialing, or past_due (still has access)
             valid_statuses = {"active", "trialing", "past_due"}
             valid_sub = next(
                 (s for s in subs.data if s.status in valid_statuses), None
@@ -205,21 +194,17 @@ def subscription_status():
                 user.subscription_end = datetime.datetime.utcfromtimestamp(
                     valid_sub.current_period_end
                 )
+                cancel_at_period_end = bool(valid_sub.cancel_at_period_end)
                 db.session.commit()
-                print(f"[SUB STATUS] Activated! status={valid_sub.status}, "
-                      f"ends={user.subscription_end}")
-            else:
-                print(f"[SUB STATUS] No valid subscription found on Stripe")
+            elif not user.is_subscribed:
+                pass  # Already not subscribed
         except Exception as e:
             print(f"[SUB STATUS] Stripe check failed: {e}")
 
-    # If still not subscribed and NO stripe_customer_id, log that too
-    if not user.is_subscribed and not user.stripe_customer_id:
-        print(f"[SUB STATUS] No stripe_customer_id saved for user {user_id}")
-
     return jsonify({
-        "subscribed":        user.is_subscribed or False,
-        "subscription_end":  user.subscription_end.isoformat() if user.subscription_end else None,
+        "subscribed":           user.is_subscribed or False,
+        "subscription_end":     user.subscription_end.isoformat() if user.subscription_end else None,
+        "cancel_at_period_end": cancel_at_period_end,
     })
 
 
