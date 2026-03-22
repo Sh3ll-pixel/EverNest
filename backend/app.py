@@ -93,7 +93,176 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── Database models ──────────────────────────────────────────────────────────
+# ── Email System (Resend) ────────────────────────────────────────────────────
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_FROM = "EverNest <noreply@mail.evernest.pro>"
+
+
+def send_email(to, subject, html_body):
+    """Send an email via Resend API. Runs in a background thread to avoid blocking."""
+    if not RESEND_API_KEY:
+        print(f"[EMAIL] Skipped (no API key): {subject} → {to}")
+        return
+
+    def _send():
+        try:
+            resp = requests.post("https://api.resend.com/emails", json={
+                "from": EMAIL_FROM,
+                "to": [to],
+                "subject": subject,
+                "html": html_body,
+            }, headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            }, timeout=10)
+            if resp.ok:
+                print(f"[EMAIL] Sent: {subject} → {to}")
+            else:
+                print(f"[EMAIL] Failed ({resp.status_code}): {subject} → {to} | {resp.text}")
+        except Exception as e:
+            print(f"[EMAIL] Error: {subject} → {to} | {e}")
+
+    import threading
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _email_wrap(title, body_html):
+    """Wrap email content in a styled template."""
+    return f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+                background:#0c0e14;padding:40px 20px;">
+      <div style="max-width:520px;margin:0 auto;background:#161a1f;border-radius:12px;
+                  border:1px solid #2a2f38;overflow:hidden;">
+        <div style="background:#5b6ef7;padding:4px 0;"></div>
+        <div style="padding:32px;">
+          <h2 style="color:#e5e7eb;margin:0 0 6px 0;font-size:20px;">{title}</h2>
+          <div style="color:#9ca3af;font-size:14px;line-height:1.6;">
+            {body_html}
+          </div>
+          <div style="margin-top:28px;padding-top:16px;border-top:1px solid #2a2f38;">
+            <span style="color:#5b6ef7;font-weight:700;font-size:14px;">EverNest</span>
+            <span style="color:#4b5563;font-size:12px;"> — Home Management</span>
+          </div>
+        </div>
+      </div>
+      <p style="text-align:center;color:#4b5563;font-size:11px;margin-top:16px;">
+        N0Ctrl Studios · <a href="https://www.evernest.pro" style="color:#5b6ef7;">evernest.pro</a>
+      </p>
+    </div>
+    """
+
+
+def email_welcome(username, email):
+    send_email(email, "Welcome to EverNest!", _email_wrap(
+        f"Welcome, {username}!",
+        """
+        <p style="color:#d1d5db;">Your EverNest account has been created.</p>
+        <p style="color:#d1d5db;">Here's what you can do next:</p>
+        <ul style="color:#d1d5db;padding-left:20px;">
+          <li>Set up your profile picture</li>
+          <li>Connect your bank account</li>
+          <li>Create your first calendar event</li>
+          <li>Invite your family members</li>
+        </ul>
+        <p style="color:#9ca3af;font-size:12px;">If you didn't create this account, you can ignore this email.</p>
+        """
+    ))
+
+
+def email_login(username, email):
+    now = datetime.datetime.utcnow().strftime("%B %d, %Y at %I:%M %p UTC")
+    send_email(email, "New login to EverNest", _email_wrap(
+        "New Sign-In Detected",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">Your EverNest account was just signed into on <strong>{now}</strong>.</p>
+        <p style="color:#9ca3af;font-size:12px;">If this was you, no action is needed.
+        If you didn't sign in, please change your password immediately.</p>
+        """
+    ))
+
+
+def email_subscription_confirmed(username, email, end_date):
+    end_str = end_date.strftime("%B %d, %Y") if end_date else "your next billing date"
+    send_email(email, "EverNest Pro — Subscription Confirmed", _email_wrap(
+        "You're now an EverNest Pro member!",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">Your EverNest Pro subscription is now active. You have full access to:</p>
+        <ul style="color:#d1d5db;padding-left:20px;">
+          <li>Bank account connectivity via Plaid</li>
+          <li>Smart budget tracking</li>
+          <li>Family sharing</li>
+          <li>All Pro features</li>
+        </ul>
+        <p style="color:#d1d5db;">Your next billing date is <strong>{end_str}</strong>.</p>
+        <p style="color:#9ca3af;font-size:12px;">You can manage or cancel your subscription anytime in Settings.</p>
+        """
+    ))
+
+
+def email_subscription_cancelled(username, email, end_date):
+    end_str = end_date.strftime("%B %d, %Y") if end_date else "the end of your billing period"
+    send_email(email, "EverNest Pro — Subscription Cancelled", _email_wrap(
+        "Your subscription has been cancelled",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">Your EverNest Pro subscription has been cancelled.
+        You'll continue to have full access until <strong>{end_str}</strong>.</p>
+        <p style="color:#d1d5db;">After that date, you'll still have access to free features like the calendar, notes, and dashboard.</p>
+        <p style="color:#9ca3af;font-size:12px;">Changed your mind? You can resubscribe anytime from the Subscribe tab.</p>
+        """
+    ))
+
+
+def email_bank_connected(username, email):
+    send_email(email, "Bank Account Connected — EverNest", _email_wrap(
+        "Bank Account Connected",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">A bank account has been successfully linked to your EverNest account via Plaid.</p>
+        <p style="color:#d1d5db;">You can now view your account balances, transaction history, and budget tracking on the Financial and Budget tabs.</p>
+        <p style="color:#9ca3af;font-size:12px;">If you didn't connect a bank account, please disconnect it immediately in Settings and change your password.</p>
+        """
+    ))
+
+
+def email_family_created(username, email, family_name):
+    send_email(email, f"Family Created — {family_name}", _email_wrap(
+        f"You created a family: {family_name}",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">Your family group <strong>{family_name}</strong> has been created in EverNest.</p>
+        <p style="color:#d1d5db;">You can now invite household members to join. They'll be able to see shared calendar events, budgets, and financial overviews.</p>
+        """
+    ))
+
+
+def email_family_invite(inviter_name, invitee_email, family_name):
+    send_email(invitee_email, f"You're invited to join {family_name} on EverNest", _email_wrap(
+        f"You've been invited to a family!",
+        f"""
+        <p style="color:#d1d5db;"><strong>{inviter_name}</strong> has invited you to join the family
+        <strong>{family_name}</strong> on EverNest.</p>
+        <p style="color:#d1d5db;">Open EverNest and go to the <strong>My Family</strong> tab to accept the invitation.</p>
+        <p style="color:#9ca3af;font-size:12px;">If you don't have an EverNest account, you'll need to create one first at
+        <a href="https://www.evernest.pro" style="color:#5b6ef7;">evernest.pro</a>.</p>
+        """
+    ))
+
+
+def email_family_member_joined(owner_email, owner_name, new_member_name, family_name):
+    send_email(owner_email, f"{new_member_name} joined {family_name}", _email_wrap(
+        f"New family member!",
+        f"""
+        <p style="color:#d1d5db;">Hi {owner_name},</p>
+        <p style="color:#d1d5db;"><strong>{new_member_name}</strong> has accepted your invitation and joined
+        <strong>{family_name}</strong>.</p>
+        <p style="color:#d1d5db;">They can now see shared calendar events and contribute to your household's financial overview.</p>
+        """
+    ))
+
+# ── Database models ───────────────────────────────────────────────────────────
 class User(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
     username      = db.Column(db.String(80), unique=True, nullable=False)
@@ -311,7 +480,8 @@ def stripe_webhook():
                 datetime.datetime.utcnow() + datetime.timedelta(days=31)
             )
             db.session.commit()
- 
+            email_subscription_confirmed(user.username, user.email, user.subscription_end)
+
     elif event["type"] in ("invoice.payment_failed", "customer.subscription.deleted"):
         customer_id = event["data"]["object"].get("customer")
         user = User.query.filter_by(stripe_customer_id=customer_id).first()
@@ -603,7 +773,11 @@ def create_family():
     member = FamilyMember(family_id=family.id, user_id=user_id, color="#96abff")
     db.session.add(member)
     db.session.commit()
- 
+
+    user = User.query.get(user_id)
+    if user:
+        email_family_created(user.username, user.email, name)
+
     return jsonify({"success": True, "family_id": family.id, "name": family.name}), 201
  
  
@@ -701,6 +875,11 @@ def invite_to_family():
     )
     db.session.add(invite)
     db.session.commit()
+
+    inviter = User.query.get(user_id)
+    inviter_name = inviter.username if inviter else "Someone"
+    email_family_invite(inviter_name, invited_email, family.name)
+
     return jsonify({"success": True, "message": f"Invite sent to {invited_email}."})
  
  
@@ -729,6 +908,16 @@ def respond_to_invite():
                 color=colors[count % len(colors)]
             )
             db.session.add(member)
+
+            # Notify the family creator
+            family = Family.query.get(invite.family_id)
+            new_user = User.query.get(user_id)
+            if family and new_user:
+                owner = User.query.get(family.created_by)
+                if owner:
+                    email_family_member_joined(
+                        owner.email, owner.username,
+                        new_user.username, family.name)
     else:
         invite.status = "declined"
  
@@ -1663,6 +1852,7 @@ def signup():
     db.session.commit()
 
     token = generate_token(new_user.id)
+    email_welcome(username, email)
     return jsonify({"success": True, "message": "Signup successful", "token": token}), 201
 
 @app.route("/login", methods=["POST"])
@@ -1684,6 +1874,7 @@ def login():
     family, member = get_user_family(user.id)
 
     token = generate_token(user.id)
+    email_login(user.username, user.email)
     return jsonify({
     "success": True,
     "message": "Login successful",
@@ -1892,6 +2083,7 @@ def cancel_subscription():
         print(f"[SUB CANCEL] No stripe_customer_id for user {user_id}")
         return jsonify({"success": False, "message": "No payment method on file"}), 400
 
+    email_subscription_cancelled(user.username, user.email, user.subscription_end)
     return jsonify({"success": True})
 
 # ── Plaid routes ─────────────────────────────────────────────────────────────
@@ -1957,6 +2149,7 @@ def exchange_token():
             user.plaid_item_id         = item_id
             user.plaid_reauth_required = False
             db.session.commit()
+            email_bank_connected(user.username, user.email)
 
         return jsonify({"success": True})
     except plaid.ApiException as e:
