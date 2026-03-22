@@ -746,13 +746,15 @@ class ShoppingList(db.Model):
 
 
 class ShoppingItem(db.Model):
-    id        = db.Column(db.Integer, primary_key=True)
-    list_id   = db.Column(db.Integer, db.ForeignKey("shopping_list.id"), nullable=False)
-    name      = db.Column(db.String(200), nullable=False)
-    quantity  = db.Column(db.String(50), default="")             # "2 lbs", "1 dozen", etc.
-    category  = db.Column(db.String(50), default="")             # Produce, Dairy, etc.
-    checked   = db.Column(db.Boolean, default=False)
-    added_by  = db.Column(db.Integer, nullable=True)             # user_id who added it
+    id         = db.Column(db.Integer, primary_key=True)
+    list_id    = db.Column(db.Integer, db.ForeignKey("shopping_list.id"), nullable=False)
+    name       = db.Column(db.String(200), nullable=False)
+    quantity   = db.Column(db.String(50), default="")
+    category   = db.Column(db.String(50), default="")
+    checked    = db.Column(db.Boolean, default=False)
+    added_by   = db.Column(db.Integer, nullable=True)
+    checked_by = db.Column(db.Integer, nullable=True)
+    checked_at = db.Column(db.DateTime, nullable=True)
 
 # ── Family Helpers ───────────────────────────────────────────────────────────
  
@@ -1038,6 +1040,8 @@ def get_shopping_items():
     result = []
     for item in items:
         adder = User.query.get(item.added_by) if item.added_by else None
+        checker = User.query.get(item.checked_by) if getattr(item, 'checked_by', None) else None
+        checked_at = getattr(item, 'checked_at', None)
         result.append({
             "id": item.id,
             "name": item.name,
@@ -1045,6 +1049,8 @@ def get_shopping_items():
             "category": item.category,
             "checked": item.checked,
             "added_by": adder.username if adder else "",
+            "checked_by": checker.username if checker else "",
+            "checked_at": checked_at.isoformat() if checked_at else "",
         })
     return jsonify({"items": result})
 
@@ -1076,7 +1082,14 @@ def toggle_shopping_item(item_id):
     item = ShoppingItem.query.get(item_id)
     if not item:
         return jsonify({"error": "Item not found"}), 404
+    data = request.get_json() or {}
     item.checked = not item.checked
+    if item.checked:
+        item.checked_by = int(data.get("user_id", 0)) or None
+        item.checked_at = datetime.datetime.utcnow()
+    else:
+        item.checked_by = None
+        item.checked_at = None
     db.session.commit()
     return jsonify({"success": True, "checked": item.checked})
 
@@ -3053,6 +3066,12 @@ def migrate_shopping():
                     added_by INTEGER
                 )
             """))
+            conn.execute(db.text(
+                "ALTER TABLE shopping_item ADD COLUMN IF NOT EXISTS checked_by INTEGER"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE shopping_item ADD COLUMN IF NOT EXISTS checked_at TIMESTAMP"
+            ))
             conn.commit()
         return "Shopping migration successful", 200
     except Exception as e:
