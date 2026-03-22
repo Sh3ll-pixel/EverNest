@@ -1233,16 +1233,338 @@ def home():
     return "API running", 200
 
 
+# ==============================================================================
+# Admin Panel — protected by SECRET_KEY
+# ==============================================================================
+
+@app.route("/admin")
+def admin_panel():
+    """Serve the admin panel HTML. Auth happens client-side via admin_key."""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>EverNest Admin</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                   background: #0c0e14; color: #e5e7eb; min-height: 100vh; }
+            .login-wrap { display: flex; justify-content: center; align-items: center;
+                          height: 100vh; }
+            .login-card { background: #161a1f; border: 1px solid #2a2f38; border-radius: 12px;
+                          padding: 40px; width: 360px; text-align: center; }
+            .login-card h2 { color: #8b9cf7; margin-bottom: 8px; }
+            .login-card p { color: #4b5563; font-size: 13px; margin-bottom: 24px; }
+            input, select { width: 100%; padding: 10px 14px; border-radius: 8px;
+                     border: 1px solid #2a2f38; background: #0c0e14; color: #e5e7eb;
+                     font-size: 14px; margin-bottom: 12px; outline: none; }
+            input:focus { border-color: #5b6ef7; }
+            button { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
+                     font-size: 13px; font-weight: 600; transition: all 0.15s; }
+            .btn-primary { background: #5b6ef7; color: #fff; width: 100%; }
+            .btn-primary:hover { background: #4a5ce0; }
+            .btn-danger { background: transparent; color: #f87171; border: 1px solid #f87171; }
+            .btn-danger:hover { background: #2a1520; }
+            .btn-success { background: #4ade80; color: #0c0e14; }
+            .btn-success:hover { background: #3bca70; }
+            .btn-warn { background: #fbbf24; color: #0c0e14; }
+            .btn-warn:hover { background: #e5ac1e; }
+            .btn-sm { padding: 6px 14px; font-size: 12px; }
+
+            .panel { display: none; max-width: 900px; margin: 0 auto; padding: 30px; }
+            .panel.active { display: block; }
+            .header { display: flex; justify-content: space-between; align-items: center;
+                       margin-bottom: 24px; border-bottom: 2px solid #5b6ef7; padding-bottom: 16px; }
+            .header h1 { font-size: 22px; color: #e5e7eb; }
+            .header span { color: #4b5563; font-size: 12px; }
+            .section { background: #161a1f; border: 1px solid #2a2f38; border-radius: 10px;
+                        padding: 20px; margin-bottom: 20px; }
+            .section h3 { color: #8b9cf7; margin-bottom: 12px; font-size: 15px; }
+            .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+            .row input, .row select { margin-bottom: 0; }
+            .row input { flex: 1; }
+            .msg { padding: 10px 14px; border-radius: 8px; margin-top: 10px; font-size: 13px; }
+            .msg-ok { background: #0f2918; color: #4ade80; border: 1px solid #166534; }
+            .msg-err { background: #2a1520; color: #f87171; border: 1px solid #7f1d1d; }
+
+            table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+            th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #2a2f38;
+                      font-size: 13px; }
+            th { color: #6b7280; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+            td { color: #d1d5db; }
+            .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+                      font-size: 11px; font-weight: 600; }
+            .badge-active { background: #166534; color: #4ade80; }
+            .badge-cancelled { background: #78350f; color: #fbbf24; }
+            .badge-inactive { background: #1f2328; color: #6b7280; }
+        </style>
+    </head>
+    <body>
+        <!-- Login -->
+        <div class="login-wrap" id="loginView">
+            <div class="login-card">
+                <h2>EverNest Admin</h2>
+                <p>Enter your admin key to continue</p>
+                <input type="password" id="adminKeyInput" placeholder="Admin Key (SECRET_KEY)">
+                <button class="btn-primary" onclick="doLogin()">Sign In</button>
+                <div id="loginMsg"></div>
+            </div>
+        </div>
+
+        <!-- Admin Panel -->
+        <div class="panel" id="adminPanel">
+            <div class="header">
+                <div>
+                    <h1>EverNest Admin Panel</h1>
+                    <span>N0Ctrl Studios — Developer Tools</span>
+                </div>
+                <button class="btn-danger btn-sm" onclick="logout()">Logout</button>
+            </div>
+
+            <!-- Search User -->
+            <div class="section">
+                <h3>🔍  Find User</h3>
+                <div class="row">
+                    <input type="text" id="searchInput" placeholder="Search by email or username">
+                    <button class="btn-primary btn-sm" onclick="searchUser()">Search</button>
+                    <button class="btn-primary btn-sm" onclick="listAllUsers()">List All</button>
+                </div>
+                <div id="searchResult"></div>
+            </div>
+
+            <!-- Grant Subscription -->
+            <div class="section">
+                <h3>⭐  Grant Free Subscription</h3>
+                <div class="row">
+                    <input type="text" id="grantEmail" placeholder="Email or username">
+                    <select id="grantDays" style="width:140px;flex:none;">
+                        <option value="30">30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="180">6 months</option>
+                        <option value="365" selected>1 year</option>
+                        <option value="36500">Lifetime</option>
+                    </select>
+                    <button class="btn-success btn-sm" onclick="grantSub()">Grant</button>
+                </div>
+                <div id="grantMsg"></div>
+            </div>
+
+            <!-- Remove Subscription -->
+            <div class="section">
+                <h3>🚫  Remove Subscription</h3>
+                <div class="row">
+                    <input type="text" id="revokeEmail" placeholder="Email or username">
+                    <button class="btn-danger btn-sm" onclick="revokeSub()">Revoke</button>
+                </div>
+                <div id="revokeMsg"></div>
+            </div>
+
+            <!-- Users Table -->
+            <div class="section">
+                <h3>👥  Users</h3>
+                <div id="usersTable"></div>
+            </div>
+        </div>
+
+        <script>
+            let ADMIN_KEY = '';
+            const API = '';
+
+            function doLogin() {
+                ADMIN_KEY = document.getElementById('adminKeyInput').value;
+                // Test the key with a simple request
+                fetch(API + '/admin/users', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({admin_key: ADMIN_KEY})
+                })
+                .then(r => { if (!r.ok) throw new Error('Invalid key'); return r.json(); })
+                .then(() => {
+                    document.getElementById('loginView').style.display = 'none';
+                    document.getElementById('adminPanel').classList.add('active');
+                    listAllUsers();
+                })
+                .catch(() => {
+                    document.getElementById('loginMsg').innerHTML =
+                        '<div class="msg msg-err">Invalid admin key</div>';
+                });
+            }
+
+            // Enter key on password field
+            document.getElementById('adminKeyInput').addEventListener('keypress', e => {
+                if (e.key === 'Enter') doLogin();
+            });
+
+            function logout() {
+                ADMIN_KEY = '';
+                document.getElementById('adminPanel').classList.remove('active');
+                document.getElementById('loginView').style.display = 'flex';
+                document.getElementById('adminKeyInput').value = '';
+            }
+
+            function adminFetch(path, body) {
+                return fetch(API + path, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({admin_key: ADMIN_KEY, ...body})
+                }).then(r => r.json());
+            }
+
+            function searchUser() {
+                const q = document.getElementById('searchInput').value.trim();
+                if (!q) return;
+                adminFetch('/admin/search', {query: q}).then(data => {
+                    if (data.error) {
+                        document.getElementById('searchResult').innerHTML =
+                            '<div class="msg msg-err">' + data.error + '</div>';
+                        return;
+                    }
+                    document.getElementById('searchResult').innerHTML = renderUserCard(data.user);
+                });
+            }
+
+            function listAllUsers() {
+                adminFetch('/admin/users', {}).then(data => {
+                    if (!data.users) return;
+                    let html = '<table><tr><th>ID</th><th>Username</th><th>Email</th>' +
+                               '<th>Status</th><th>Ends</th><th>Actions</th></tr>';
+                    data.users.forEach(u => {
+                        let badge = '';
+                        if (u.is_subscribed && u.cancel_at_period_end)
+                            badge = '<span class="badge badge-cancelled">Cancelled</span>';
+                        else if (u.is_subscribed)
+                            badge = '<span class="badge badge-active">Active</span>';
+                        else
+                            badge = '<span class="badge badge-inactive">Free</span>';
+
+                        let end = u.subscription_end ? u.subscription_end.substring(0, 10) : '—';
+                        html += '<tr><td>' + u.id + '</td><td>' + u.username +
+                                '</td><td>' + u.email + '</td><td>' + badge +
+                                '</td><td>' + end + '</td><td>' +
+                                '<button class="btn-success btn-sm" onclick="quickGrant(\\''+u.email+'\\')">Grant</button> ' +
+                                '<button class="btn-danger btn-sm" onclick="quickRevoke(\\''+u.email+'\\')">Revoke</button>' +
+                                '</td></tr>';
+                    });
+                    html += '</table>';
+                    document.getElementById('usersTable').innerHTML = html;
+                });
+            }
+
+            function renderUserCard(u) {
+                let badge = u.is_subscribed ?
+                    '<span class="badge badge-active">Active</span>' :
+                    '<span class="badge badge-inactive">Free</span>';
+                return '<div style="margin-top:10px;padding:12px;background:#0c0e14;' +
+                    'border-radius:8px;border:1px solid #2a2f38;">' +
+                    '<strong>' + u.username + '</strong> &lt;' + u.email + '&gt;<br>' +
+                    'ID: ' + u.id + ' | ' + badge +
+                    (u.subscription_end ? ' | Ends: ' + u.subscription_end.substring(0,10) : '') +
+                    (u.stripe_customer_id ? ' | Stripe: ' + u.stripe_customer_id : '') +
+                    (u.plaid_access_token ? ' | 🏦 Bank linked' : '') +
+                    '</div>';
+            }
+
+            function grantSub() {
+                const input = document.getElementById('grantEmail').value.trim();
+                const days = parseInt(document.getElementById('grantDays').value);
+                const isEmail = input.includes('@');
+                adminFetch('/admin/grant_subscription', {
+                    email: isEmail ? input : '', username: isEmail ? '' : input, days: days
+                }).then(data => {
+                    document.getElementById('grantMsg').innerHTML = data.success ?
+                        '<div class="msg msg-ok">Granted ' + days + ' days to ' + (data.user || input) + '</div>' :
+                        '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    listAllUsers();
+                });
+            }
+
+            function revokeSub() {
+                const input = document.getElementById('revokeEmail').value.trim();
+                const isEmail = input.includes('@');
+                adminFetch('/admin/revoke_subscription', {
+                    email: isEmail ? input : '', username: isEmail ? '' : input
+                }).then(data => {
+                    document.getElementById('revokeMsg').innerHTML = data.success ?
+                        '<div class="msg msg-ok">Revoked subscription for ' + (data.user || input) + '</div>' :
+                        '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    listAllUsers();
+                });
+            }
+
+            function quickGrant(email) {
+                adminFetch('/admin/grant_subscription', {email: email, days: 365}).then(() => listAllUsers());
+            }
+            function quickRevoke(email) {
+                adminFetch('/admin/revoke_subscription', {email: email}).then(() => listAllUsers());
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html"}
+
+
+def _admin_auth(data):
+    """Verify admin key from request body. Returns True if valid."""
+    return data.get("admin_key", "") == app.config["SECRET_KEY"]
+
+
+@app.route("/admin/users", methods=["POST"])
+def admin_list_users():
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+    users = User.query.order_by(User.id).all()
+
+    # Check Stripe cancel status for subscribed users
+    result = []
+    for u in users:
+        cancel = False
+        if u.is_subscribed and u.stripe_customer_id:
+            try:
+                subs = stripe.Subscription.list(customer=u.stripe_customer_id, limit=1)
+                for s in subs.data:
+                    if s.status in ("active", "trialing", "past_due"):
+                        cancel = bool(s.cancel_at_period_end)
+            except Exception:
+                pass
+        result.append({
+            "id": u.id, "username": u.username, "email": u.email,
+            "is_subscribed": u.is_subscribed or False,
+            "subscription_end": u.subscription_end.isoformat() if u.subscription_end else None,
+            "stripe_customer_id": u.stripe_customer_id,
+            "plaid_access_token": bool(u.plaid_access_token),
+            "cancel_at_period_end": cancel,
+        })
+    return jsonify({"users": result})
+
+
+@app.route("/admin/search", methods=["POST"])
+def admin_search_user():
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+    q = data.get("query", "").strip().lower()
+    if not q:
+        return jsonify({"error": "No search query"}), 400
+    user = User.query.filter(
+        (db.func.lower(User.email) == q) | (db.func.lower(User.username) == q)
+    ).first()
+    if not user:
+        return jsonify({"error": f"No user found matching '{q}'"}), 404
+    return jsonify({"user": {
+        "id": user.id, "username": user.username, "email": user.email,
+        "is_subscribed": user.is_subscribed or False,
+        "subscription_end": user.subscription_end.isoformat() if user.subscription_end else None,
+        "stripe_customer_id": user.stripe_customer_id,
+        "plaid_access_token": bool(user.plaid_access_token),
+    }})
+
+
 @app.route("/admin/grant_subscription", methods=["POST"])
 def admin_grant_subscription():
-    """Grant a free subscription to a user. Requires admin_key for security.
-    Usage: POST with {"admin_key": "...", "email": "user@example.com", "days": 365}
-    """
-    data      = request.get_json() or {}
-    admin_key = data.get("admin_key", "")
-
-    # Use SECRET_KEY as admin password — only you know it
-    if admin_key != app.config["SECRET_KEY"]:
+    data = request.get_json() or {}
+    if not _admin_auth(data):
         return jsonify({"error": "Unauthorized"}), 403
 
     email    = data.get("email", "").strip().lower()
@@ -1263,12 +1585,45 @@ def admin_grant_subscription():
     db.session.commit()
 
     print(f"[ADMIN] Granted {days}-day subscription to {user.username} ({user.email})")
-    return jsonify({
-        "success": True,
-        "user": user.username,
-        "email": user.email,
-        "subscription_end": user.subscription_end.isoformat(),
-    })
+    return jsonify({"success": True, "user": user.username, "email": user.email,
+                     "subscription_end": user.subscription_end.isoformat()})
+
+
+@app.route("/admin/revoke_subscription", methods=["POST"])
+def admin_revoke_subscription():
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    email    = data.get("email", "").strip().lower()
+    username = data.get("username", "").strip()
+
+    user = None
+    if email:
+        user = User.query.filter(db.func.lower(User.email) == email).first()
+    elif username:
+        user = User.query.filter(db.func.lower(User.username) == db.func.lower(username)).first()
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # Cancel on Stripe too
+    if user.stripe_customer_id:
+        try:
+            subs = stripe.Subscription.list(customer=user.stripe_customer_id)
+            for sub in subs.auto_paging_iter():
+                if sub.status in ("active", "trialing", "past_due"):
+                    stripe.Subscription.delete(sub.id)
+                    print(f"[ADMIN] Cancelled Stripe sub {sub.id} for {user.username}")
+        except Exception as e:
+            print(f"[ADMIN] Stripe cancel failed: {e}")
+
+    user.is_subscribed    = False
+    user.subscription_end = None
+    db.session.commit()
+
+    print(f"[ADMIN] Revoked subscription for {user.username} ({user.email})")
+    return jsonify({"success": True, "user": user.username})
 
 @app.route("/version")
 def get_version():
@@ -1543,17 +1898,27 @@ def cancel_subscription():
     user    = find_user_by_id(user_id)
     if not user:
         return jsonify({"success": False}), 404
- 
+
     # Cancel on Stripe if applicable
     if user.stripe_customer_id:
         try:
             subscriptions = stripe.Subscription.list(customer=user.stripe_customer_id)
+            cancelled_count = 0
             for sub in subscriptions.auto_paging_iter():
-                stripe.Subscription.modify(sub.id, cancel_at_period_end=True)
-        except Exception:
-            pass
- 
-    # Don't immediately revoke — let it expire at period end
+                if sub.status in ("active", "trialing", "past_due"):
+                    stripe.Subscription.modify(sub.id, cancel_at_period_end=True)
+                    cancelled_count += 1
+                    print(f"[SUB CANCEL] Set cancel_at_period_end=True on sub {sub.id} for user {user_id}")
+            if cancelled_count == 0:
+                print(f"[SUB CANCEL] No active subscriptions found for user {user_id}")
+                return jsonify({"success": False, "message": "No active subscription found"}), 400
+        except Exception as e:
+            print(f"[SUB CANCEL] Stripe error for user {user_id}: {e}")
+            return jsonify({"success": False, "message": "Failed to cancel on Stripe"}), 500
+    else:
+        print(f"[SUB CANCEL] No stripe_customer_id for user {user_id}")
+        return jsonify({"success": False, "message": "No payment method on file"}), 400
+
     return jsonify({"success": True})
 
 # ── Plaid routes ──────────────────────────────────────────────────────────────
