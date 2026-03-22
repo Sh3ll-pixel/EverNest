@@ -1098,14 +1098,15 @@ class CalendarEvent(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
     user_id       = db.Column(db.String(80), nullable=False)
     title         = db.Column(db.String(200), nullable=False)
-    event_date    = db.Column(db.String(10), nullable=False)   # YYYY-MM-DD
+    event_date    = db.Column(db.String(10), nullable=False)   # YYYY-MM-DD (start date)
+    end_date      = db.Column(db.String(10), nullable=True)    # YYYY-MM-DD (end date, null = same day)
     event_type    = db.Column(db.String(50), default="Other")
     event_time    = db.Column(db.String(20), nullable=True)
     notify_before = db.Column(db.String(20), default="None")
     note          = db.Column(db.String(500), nullable=True)
-    color         = db.Column(db.String(10), nullable=True)    # custom hex color
-    recurrence    = db.Column(db.String(20), default="None")   # None/Daily/Weekly/Bi-Weekly/Monthly/Yearly
-    family_shared = db.Column(db.Boolean, default=True)        # visible to family members
+    color         = db.Column(db.String(10), nullable=True)
+    recurrence    = db.Column(db.String(20), default="None")
+    family_shared = db.Column(db.Boolean, default=True)
 
 
 # ── Calendar routes ─────────────────────────────────────────────────────────
@@ -1217,6 +1218,7 @@ def get_calendar_events():
             "id":            ev.id,
             "title":         ev.title,
             "event_date":    date_str,
+            "end_date":      getattr(ev, 'end_date', None) or date_str,
             "event_type":    ev.event_type,
             "event_time":    ev.event_time,
             "notify_before": ev.notify_before,
@@ -1307,6 +1309,7 @@ def add_calendar_event():
         user_id       = str(data.get("user_id", "")),
         title         = data.get("title", ""),
         event_date    = data.get("event_date", ""),
+        end_date      = data.get("end_date", "") or None,
         event_type    = data.get("event_type", "Other"),
         event_time    = data.get("event_time", ""),
         notify_before = data.get("notify_before", "None"),
@@ -1329,6 +1332,7 @@ def update_calendar_event(event_id):
     data = request.get_json() or {}
     ev.title         = data.get("title", ev.title)
     ev.event_date    = data.get("event_date", ev.event_date)
+    ev.end_date      = data.get("end_date", ev.end_date) or None
     ev.event_type    = data.get("event_type", ev.event_type)
     ev.event_time    = data.get("event_time", ev.event_time)
     ev.notify_before = data.get("notify_before", ev.notify_before)
@@ -1360,6 +1364,7 @@ def debug_calendar_events():
         "id":            e.id,
         "title":         e.title,
         "event_date":    e.event_date,
+        "end_date":      getattr(e, 'end_date', None),
         "event_type":    e.event_type,
         "recurrence":    getattr(e, 'recurrence', 'N/A'),
         "color":         getattr(e, 'color', 'N/A'),
@@ -2791,6 +2796,9 @@ def migrate_calendar():
             ))
             conn.execute(db.text(
                 "ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS family_shared BOOLEAN DEFAULT TRUE"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE calendar_event ADD COLUMN IF NOT EXISTS end_date VARCHAR(10)"
             ))
             conn.commit()
         return "Calendar migration successful", 200
