@@ -735,6 +735,25 @@ class FamilyInvite(db.Model):
     status         = db.Column(db.String(20), default="pending")  # pending/accepted/declined
     created_at     = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
+
+# ── Shopping List Models ─────────────────────────────────────────────────────
+class ShoppingList(db.Model):
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, nullable=False)           # creator
+    family_id  = db.Column(db.Integer, nullable=True)            # shared with family if set
+    name       = db.Column(db.String(100), default="Shopping List")
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+
+class ShoppingItem(db.Model):
+    id        = db.Column(db.Integer, primary_key=True)
+    list_id   = db.Column(db.Integer, db.ForeignKey("shopping_list.id"), nullable=False)
+    name      = db.Column(db.String(200), nullable=False)
+    quantity  = db.Column(db.String(50), default="")             # "2 lbs", "1 dozen", etc.
+    category  = db.Column(db.String(50), default="")             # Produce, Dairy, etc.
+    checked   = db.Column(db.Boolean, default=False)
+    added_by  = db.Column(db.Integer, nullable=True)             # user_id who added it
+
 # ── Family Helpers ───────────────────────────────────────────────────────────
  
 def get_user_family(user_id):
@@ -935,6 +954,152 @@ def leave_family():
         db.session.delete(member)
         db.session.commit()
     return jsonify({"success": True})
+
+# ── Shopping List Routes ──────────────────────────────────────────────────────
+
+@app.route("/shopping/lists", methods=["GET"])
+@require_auth
+def get_shopping_lists():
+    """Get all shopping lists for a user (personal + family shared)."""
+    user_id = int(request.args.get("user_id", 0))
+
+    # Personal lists
+    lists = ShoppingList.query.filter_by(user_id=user_id).all()
+
+    # Family shared lists
+    family, _ = get_user_family(user_id)
+    if family:
+        family_lists = ShoppingList.query.filter(
+            ShoppingList.family_id == family.id,
+            ShoppingList.user_id != user_id
+        ).all()
+        lists.extend(family_lists)
+
+    result = []
+    for sl in lists:
+        items = ShoppingItem.query.filter_by(list_id=sl.id).all()
+        total = len(items)
+        checked = sum(1 for i in items if i.checked)
+        creator = User.query.get(sl.user_id)
+        result.append({
+            "id": sl.id,
+            "name": sl.name,
+            "user_id": sl.user_id,
+            "family_id": sl.family_id,
+            "created_by": creator.username if creator else "Unknown",
+            "total_items": total,
+            "checked_items": checked,
+            "shared": sl.family_id is not None,
+        })
+
+    return jsonify({"lists": result})
+
+
+@app.route("/shopping/lists", methods=["POST"])
+@require_auth
+def create_shopping_list():
+    data    = request.get_json() or {}
+    user_id = int(data.get("user_id", 0))
+    name    = data.get("name", "Shopping List").strip()
+    shared  = data.get("shared", False)
+
+    family_id = None
+    if shared:
+        family, _ = get_user_family(user_id)
+        if family:
+            family_id = family.id
+
+    sl = ShoppingList(user_id=user_id, family_id=family_id, name=name)
+    db.session.add(sl)
+    db.session.commit()
+
+    return jsonify({"success": True, "id": sl.id, "name": sl.name}), 201
+
+
+@app.route("/shopping/lists/<int:list_id>", methods=["DELETE"])
+@require_auth
+def delete_shopping_list(list_id):
+    sl = ShoppingList.query.get(list_id)
+    if not sl:
+        return jsonify({"error": "List not found"}), 404
+    ShoppingItem.query.filter_by(list_id=list_id).delete()
+    db.session.delete(sl)
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/shopping/items", methods=["GET"])
+@require_auth
+def get_shopping_items():
+    list_id = int(request.args.get("list_id", 0))
+    items = ShoppingItem.query.filter_by(list_id=list_id).order_by(
+        ShoppingItem.checked, ShoppingItem.id
+    ).all()
+    result = []
+    for item in items:
+        adder = User.query.get(item.added_by) if item.added_by else None
+        result.append({
+            "id": item.id,
+            "name": item.name,
+            "quantity": item.quantity,
+            "category": item.category,
+            "checked": item.checked,
+            "added_by": adder.username if adder else "",
+        })
+    return jsonify({"items": result})
+
+
+@app.route("/shopping/items", methods=["POST"])
+@require_auth
+def add_shopping_item():
+    data    = request.get_json() or {}
+    list_id = int(data.get("list_id", 0))
+    name    = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Item name required"}), 400
+
+    item = ShoppingItem(
+        list_id  = list_id,
+        name     = name,
+        quantity = data.get("quantity", "").strip(),
+        category = data.get("category", "").strip(),
+        added_by = int(data.get("user_id", 0)) or None,
+    )
+    db.session.add(item)
+    db.session.commit()
+    return jsonify({"success": True, "id": item.id}), 201
+
+
+@app.route("/shopping/items/<int:item_id>/check", methods=["POST"])
+@require_auth
+def toggle_shopping_item(item_id):
+    item = ShoppingItem.query.get(item_id)
+    if not item:
+        return jsonify({"error": "Item not found"}), 404
+    item.checked = not item.checked
+    db.session.commit()
+    return jsonify({"success": True, "checked": item.checked})
+
+
+@app.route("/shopping/items/<int:item_id>", methods=["DELETE"])
+@require_auth
+def delete_shopping_item(item_id):
+    item = ShoppingItem.query.get(item_id)
+    if not item:
+        return jsonify({"error": "Item not found"}), 404
+    db.session.delete(item)
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/shopping/lists/<int:list_id>/clear_checked", methods=["POST"])
+@require_auth
+def clear_checked_items(list_id):
+    """Remove all checked items from a list."""
+    ShoppingItem.query.filter_by(list_id=list_id, checked=True).delete()
+    db.session.commit()
+    return jsonify({"success": True})
+
 
 # ── Note Model ───────────────────────────────────────────────────────────────
 class Note(db.Model):
@@ -2450,6 +2615,7 @@ def plaid_connection_status():
 @app.route("/plaid/link")
 def plaid_link_page():
     user_id = request.args.get("user_id", "default_user")
+    token   = request.args.get("token", "")
     html = """
     <!DOCTYPE html>
     <html>
@@ -2466,16 +2632,27 @@ def plaid_link_page():
         <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
         <script>
             const userId = \"""" + user_id + """\";
+            const authToken = \"""" + token + """\";
+            const authHeaders = {"Content-Type": "application/json"};
+            if (authToken) authHeaders["Authorization"] = "Bearer " + authToken;
+
             fetch("/plaid/create_link_token", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
+                headers: authHeaders,
                 body: JSON.stringify({user_id: userId})
             })
-            .then(r => r.json())
+            .then(r => {
+                if (!r.ok) throw new Error("Auth failed (" + r.status + ")");
+                return r.json();
+            })
             .then(data => {
-                // Store for OAuth return page
+                if (data.error) {
+                    document.getElementById("status").innerHTML = "<p style='color:#ff6b6b'>" + data.error + "</p>";
+                    return;
+                }
                 localStorage.setItem('evernest_link_token', data.link_token);
                 localStorage.setItem('evernest_link_user_id', userId);
+                localStorage.setItem('evernest_auth_token', authToken);
                 const handler = Plaid.create({
                     token: data.link_token,
                     onSuccess: function(public_token, metadata) {
@@ -2483,13 +2660,14 @@ def plaid_link_page():
                         document.getElementById("status").innerHTML = "<p>Linking account...</p>";
                         fetch("/plaid/exchange_token", {
                             method: "POST",
-                            headers: {"Content-Type": "application/json"},
+                            headers: authHeaders,
                             body: JSON.stringify({public_token: public_token, user_id: userId})
                         })
                         .then(r => r.json())
                         .then(() => {
                             localStorage.removeItem('evernest_link_token');
                             localStorage.removeItem('evernest_link_user_id');
+                            localStorage.removeItem('evernest_auth_token');
                             document.getElementById("status").innerHTML =
                                 "<p style='color:#4CFF7A'>✓ Bank connected! Close this tab and click Refresh in EverNest.</p>";
                         });
@@ -2498,7 +2676,7 @@ def plaid_link_page():
                         console.log('[PLAID LINK] EXIT', err, metadata);
                         fetch("/plaid/log_link_event", {
                             method: "POST",
-                            headers: {"Content-Type": "application/json"},
+                            headers: authHeaders,
                             body: JSON.stringify({
                                 event: "EXIT",
                                 error: err,
@@ -2515,7 +2693,7 @@ def plaid_link_page():
                         console.log('[PLAID LINK]', eventName, metadata);
                         fetch("/plaid/log_link_event", {
                             method: "POST",
-                            headers: {"Content-Type": "application/json"},
+                            headers: authHeaders,
                             body: JSON.stringify({
                                 event: eventName,
                                 institution: metadata && metadata.institution_name,
@@ -2529,6 +2707,10 @@ def plaid_link_page():
                     }
                 });
                 handler.open();
+            })
+            .catch(err => {
+                document.getElementById("status").innerHTML =
+                    "<p style='color:#ff6b6b'>Error: " + err.message + ". Close this tab and try again.</p>";
             });
         </script>
     </body>
@@ -2566,6 +2748,9 @@ def plaid_oauth_return():
             // Re-initialize Link with the same link_token to complete the OAuth flow.
             // The link_token is stored in localStorage by the /plaid/link page.
             const linkToken = localStorage.getItem('evernest_link_token');
+            const authToken = localStorage.getItem('evernest_auth_token') || '';
+            const authHeaders = {"Content-Type": "application/json"};
+            if (authToken) authHeaders["Authorization"] = "Bearer " + authToken;
 
             if (linkToken) {
                 const handler = Plaid.create({
@@ -2575,11 +2760,10 @@ def plaid_oauth_return():
                         console.log('[PLAID LINK] SUCCESS (OAuth)', metadata);
                         document.getElementById("status").innerHTML =
                             "<p>Linking account...</p>";
-                        // Get user_id from localStorage
                         const userId = localStorage.getItem('evernest_link_user_id') || 'default_user';
                         fetch("/plaid/exchange_token", {
                             method: "POST",
-                            headers: {"Content-Type": "application/json"},
+                            headers: authHeaders,
                             body: JSON.stringify({public_token: public_token, user_id: userId})
                         })
                         .then(r => r.json())
@@ -2589,6 +2773,7 @@ def plaid_oauth_return():
                                 "<p style='color:#6b7280; font-size:14px;'>Close this tab and click Refresh in EverNest.</p>";
                             localStorage.removeItem('evernest_link_token');
                             localStorage.removeItem('evernest_link_user_id');
+                            localStorage.removeItem('evernest_auth_token');
                         });
                     },
                     onExit: function(err, metadata) {
@@ -2606,7 +2791,7 @@ def plaid_oauth_return():
                         console.log('[PLAID LINK]', eventName, metadata);
                         fetch("/plaid/log_link_event", {
                             method: "POST",
-                            headers: {"Content-Type": "application/json"},
+                            headers: authHeaders,
                             body: JSON.stringify({
                                 event: eventName,
                                 institution: metadata && metadata.institution_name,
@@ -2840,6 +3025,36 @@ def migrate_plaid():
             ))
             conn.commit()
         return "Plaid migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
+
+@app.route("/migrate_shopping")
+def migrate_shopping():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text("""
+                CREATE TABLE IF NOT EXISTS shopping_list (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    family_id INTEGER,
+                    name VARCHAR(100) DEFAULT 'Shopping List',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(db.text("""
+                CREATE TABLE IF NOT EXISTS shopping_item (
+                    id SERIAL PRIMARY KEY,
+                    list_id INTEGER NOT NULL REFERENCES shopping_list(id),
+                    name VARCHAR(200) NOT NULL,
+                    quantity VARCHAR(50) DEFAULT '',
+                    category VARCHAR(50) DEFAULT '',
+                    checked BOOLEAN DEFAULT FALSE,
+                    added_by INTEGER
+                )
+            """))
+            conn.commit()
+        return "Shopping migration successful", 200
     except Exception as e:
         return str(e), 400
 
