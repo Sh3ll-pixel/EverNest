@@ -27,7 +27,7 @@ CORS(app)
 
 
 
-# ── App config ────────────────────────────────────────────────────────────────
+# ── App config ─────────────────────────────────────────────────────────────
 database_url = os.environ.get("DATABASE_URL", "sqlite:///users.db")
 # Render uses postgres:// but SQLAlchemy needs postgresql://
 if database_url.startswith("postgres://"):
@@ -50,7 +50,7 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 
-# ── JWT Authentication ────────────────────────────────────────────────────────
+# ── JWT Authentication ───────────────────────────────────────────────────────
 JWT_SECRET = app.config["SECRET_KEY"]
 JWT_EXPIRY_HOURS = 72  # Tokens last 3 days
 
@@ -93,7 +93,7 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# ── Database models ───────────────────────────────────────────────────────────
+# ── Database models ──────────────────────────────────────────────────────────
 class User(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
     username      = db.Column(db.String(80), unique=True, nullable=False)
@@ -130,15 +130,12 @@ def find_user_by_id(user_id):
     return User.query.filter(User.username == user_id).first()
 
 
-#===============================================================================
-# Stripe and Paypal
-# ==============================================================================
-# ── Stripe setup ──────────────────────────────────────────────────────────────
+# ── Stripe setup ────────────────────────────────────────────────────────────
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRICE_ID       = os.getenv("STRIPE_PRICE_ID")
  
-# ── PayPal setup ──────────────────────────────────────────────────────────────
+# ── PayPal setup ────────────────────────────────────────────────────────────
 PAYPAL_CLIENT_ID     = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 PAYPAL_PLAN_ID       = os.getenv("PAYPAL_PLAN_ID")
@@ -162,7 +159,7 @@ def get_paypal_access_token():
  
 
  
-# ── Check subscription status ─────────────────────────────────────────────────
+# ── Check subscription status ────────────────────────────────────────────
 @app.route("/subscription/status", methods=["GET"])
 @require_auth
 def subscription_status():
@@ -248,7 +245,7 @@ def subscription_debug():
     return jsonify(debug)
  
  
-# ── Stripe: create checkout session ──────────────────────────────────────────
+# ── Stripe: create checkout session ───────────────────────────────────────
 @app.route("/subscription/stripe/create-session", methods=["POST"])
 @require_auth
 def stripe_create_session():
@@ -286,7 +283,7 @@ def stripe_create_session():
         return jsonify({"error": str(e)}), 400
  
  
-# ── Stripe: webhook ───────────────────────────────────────────────────────────
+# ── Stripe: webhook ───────────────────────────────────────────────────────
 @app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
     payload   = request.get_data(as_text=True)
@@ -326,7 +323,7 @@ def stripe_webhook():
    
    
  
-# ── Stripe: success / cancel redirect pages ───────────────────────────────────
+# ── Stripe: success / cancel redirect pages ─────────────────────────
 @app.route("/subscription/success")
 def subscription_success():
     session_id = request.args.get("session_id")
@@ -410,7 +407,7 @@ def subscription_cancel():
     """, 200, {"Content-Type": "text/html"}
  
  
-# ── PayPal: create subscription ───────────────────────────────────────────────
+# ── PayPal: create subscription ───────────────────────────────────────────
 @app.route("/subscription/paypal/create", methods=["POST"])
 @require_auth
 def paypal_create_subscription():
@@ -459,7 +456,7 @@ def paypal_create_subscription():
         return jsonify({"error": str(e)}), 400
  
  
-# ── PayPal: webhook ───────────────────────────────────────────────────────────
+# ── PayPal: webhook ───────────────────────────────────────────────────────
 @app.route("/paypal/webhook", methods=["POST"])
 def paypal_webhook():
     try:
@@ -510,7 +507,7 @@ def paypal_success():
     """, 200, {"Content-Type": "text/html"}
  
  
-# ── Daily job: expire lapsed subscriptions ────────────────────────────────────
+# ── Daily job: expire lapsed subscriptions ────────────────────────────────
 #def expire_lapsed_subscriptions():
 #    with app.app_context():
 #        now      = datetime.datetime.utcnow()
@@ -527,9 +524,7 @@ def paypal_success():
 # Start scheduler
 
 
-# ==============================================================================
-# Budget Model
-# ==============================================================================
+# ── Budget Model ────────────────────────────────────────────────────────────
 class Budget(db.Model):
     id          = db.Column(db.Integer, primary_key=True)
     user_id     = db.Column(db.String(80), unique=True, nullable=False)
@@ -540,9 +535,7 @@ class Budget(db.Model):
     bills       = db.Column(db.Text, default="[]")   # JSON string
 
 
-# ==============================================================================
-# Balance Snapshot Model (for net worth over time chart)
-# ==============================================================================
+# ── Balance Snapshot Model (for net worth over time chart) ──────────────────
 class BalanceSnapshot(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
     user_id    = db.Column(db.String(80), nullable=False)
@@ -550,9 +543,7 @@ class BalanceSnapshot(db.Model):
     net_worth  = db.Column(db.Float, default=0)
     __table_args__ = (db.UniqueConstraint('user_id', 'date', name='uq_user_date'),)
 
-# =============================================================================
-# Family Models
-# =============================================================================
+# ── Family Models ────────────────────────────────────────────────────────────
 class Family(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
     name       = db.Column(db.String(100), default="My Family")
@@ -574,10 +565,7 @@ class FamilyInvite(db.Model):
     status         = db.Column(db.String(20), default="pending")  # pending/accepted/declined
     created_at     = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
-# ==============================================================================
-# Family Routes
-# ==============================================================================
-# ── Helper: get user's family ─────────────────────────────────────────────────
+# ── Family Helpers ───────────────────────────────────────────────────────────
  
 def get_user_family(user_id):
     """Returns (family, member) or (None, None)"""
@@ -594,7 +582,7 @@ def get_family_member_ids(family_id):
     return [m.user_id for m in members]
  
  
-# ── Family routes ─────────────────────────────────────────────────────────────
+# ── Family routes ─────────────────────────────────────────────────────────
  
 @app.route("/family/create", methods=["POST"])
 @require_auth
@@ -759,9 +747,7 @@ def leave_family():
         db.session.commit()
     return jsonify({"success": True})
 
-# ==============================================================================
-# Note Model
-# ==============================================================================
+# ── Note Model ───────────────────────────────────────────────────────────────
 class Note(db.Model):
     id               = db.Column(db.Integer, primary_key=True)
     user_id          = db.Column(db.String(80), nullable=False)
@@ -772,9 +758,7 @@ class Note(db.Model):
     updated_at       = db.Column(db.DateTime, default=datetime.datetime.utcnow,
                                   onupdate=datetime.datetime.utcnow)
     
-# ==============================================================================
-# Note Routes
-# ==============================================================================
+# ── Note Routes ──────────────────────────────────────────────────────────
 @app.route("/notes", methods=["GET"])
 @require_auth
 def get_notes():
@@ -839,7 +823,7 @@ def delete_note_route(note_id):
         db.session.commit()
     return jsonify({"success": True})
 
-# ── Budget routes ─────────────────────────────────────────────────────────────
+# ── Budget routes ────────────────────────────────────────────────────────────
 # Paste alongside /login, /signup, /calendar routes
 
 @app.route("/budget", methods=["GET"])
@@ -879,9 +863,7 @@ def save_budget_route():
     return jsonify({"success": True}), 201
 
 
-# ==============================================================================
-# Balance Snapshot Routes
-# ==============================================================================
+# ── Balance Snapshot Routes ─────────────────────────────────────────────────
 
 @app.route("/balance/snapshot", methods=["POST"])
 @require_auth
@@ -921,9 +903,7 @@ def get_balance_history():
     ]})
 
 
-# ── Calendar Integration ──────────────────────────────────────────────────────
-# ── Calendar model ────────────────────────────────────────────────────────────
-# Add this class alongside your User model
+# ── Calendar model ──────────────────────────────────────────────────────────
 
 class CalendarEvent(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
@@ -939,7 +919,7 @@ class CalendarEvent(db.Model):
     family_shared = db.Column(db.Boolean, default=True)        # visible to family members
 
 
-# ── Calendar routes ───────────────────────────────────────────────────────────
+# ── Calendar routes ─────────────────────────────────────────────────────────
 # Paste these alongside your /login and /signup routes
 
 @app.route("/calendar/events", methods=["GET"])
@@ -1201,7 +1181,7 @@ with app.app_context():
     db.create_all()
 
 
-# ── Plaid client setup ────────────────────────────────────────────────────────
+# ── Plaid client setup ──────────────────────────────────────────────────────
 PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
 PLAID_SECRET    = os.getenv("PLAID_SECRET")
 PLAID_ENV       = os.getenv("PLAID_ENV", "production")
@@ -1223,7 +1203,7 @@ except Exception as e:
     print(f"Warning: Plaid client init failed ({e}). Plaid routes will be unavailable.")
 
 
-# ── Core routes ───────────────────────────────────────────────────────────────
+# ── Core routes ─────────────────────────────────────────────────────────────
 
 # Current app version — bump this when you push a new release
 APP_VERSION = "1.0.0"
@@ -1233,9 +1213,7 @@ def home():
     return "API running", 200
 
 
-# ==============================================================================
-# Admin Panel — protected by SECRET_KEY
-# ==============================================================================
+# ── Admin Panel — protected by SECRET_KEY ───────────────────────────────────
 
 @app.route("/admin")
 def admin_panel():
@@ -1255,21 +1233,26 @@ def admin_panel():
                           padding: 40px; width: 360px; text-align: center; }
             .login-card h2 { color: #8b9cf7; margin-bottom: 8px; }
             .login-card p { color: #4b5563; font-size: 13px; margin-bottom: 24px; }
-            input, select { width: 100%; padding: 10px 14px; border-radius: 8px;
+            input, select { width: 100%; padding: 12px 16px; border-radius: 8px;
                      border: 1px solid #2a2f38; background: #0c0e14; color: #e5e7eb;
-                     font-size: 14px; margin-bottom: 12px; outline: none; }
-            input:focus { border-color: #5b6ef7; }
+                     font-size: 15px; margin-bottom: 12px; outline: none;
+                     min-height: 44px; }
+            input::placeholder { color: #4b5563; }
+            input:focus { border-color: #5b6ef7; box-shadow: 0 0 0 2px rgba(91,110,247,0.2); }
             button { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
                      font-size: 13px; font-weight: 600; transition: all 0.15s; }
             .btn-primary { background: #5b6ef7; color: #fff; width: 100%; }
             .btn-primary:hover { background: #4a5ce0; }
+            .row .btn-primary { width: auto; }
+            .row .btn-success { width: auto; }
+            .row .btn-danger { width: auto; }
             .btn-danger { background: transparent; color: #f87171; border: 1px solid #f87171; }
             .btn-danger:hover { background: #2a1520; }
             .btn-success { background: #4ade80; color: #0c0e14; }
             .btn-success:hover { background: #3bca70; }
             .btn-warn { background: #fbbf24; color: #0c0e14; }
             .btn-warn:hover { background: #e5ac1e; }
-            .btn-sm { padding: 6px 14px; font-size: 12px; }
+            .btn-sm { padding: 8px 18px; font-size: 13px; white-space: nowrap; min-height: 40px; }
 
             .panel { display: none; max-width: 900px; margin: 0 auto; padding: 30px; }
             .panel.active { display: block; }
@@ -1280,9 +1263,8 @@ def admin_panel():
             .section { background: #161a1f; border: 1px solid #2a2f38; border-radius: 10px;
                         padding: 20px; margin-bottom: 20px; }
             .section h3 { color: #8b9cf7; margin-bottom: 12px; font-size: 15px; }
-            .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
-            .row input, .row select { margin-bottom: 0; }
-            .row input { flex: 1; }
+            .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+            .row input, .row select { margin-bottom: 0; flex: 1; min-width: 250px; }
             .msg { padding: 10px 14px; border-radius: 8px; margin-top: 10px; font-size: 13px; }
             .msg-ok { background: #0f2918; color: #4ade80; border: 1px solid #166534; }
             .msg-err { background: #2a1520; color: #f87171; border: 1px solid #7f1d1d; }
@@ -1714,14 +1696,7 @@ def login():
     }
 }), 200
 
-# ==============================================================================
-# Temp Routes
-# ==============================================================================
-
-
-# =============================================================================
-#  SETTINGS ROUTES
-# =============================================================================
+# ── Settings Routes ──────────────────────────────────────────────────────────
  
 @app.route("/settings/update_profile", methods=["POST"])
 @require_auth
@@ -1838,9 +1813,7 @@ def delete_account():
     return jsonify({"success": True})
 
 
-# =============================================================================
-#  PROFILE PICTURE
-# =============================================================================
+# ── Profile Picture ─────────────────────────────────────────────────────────
 
 @app.route("/profile/upload_picture", methods=["POST"])
 @require_auth
@@ -1921,7 +1894,7 @@ def cancel_subscription():
 
     return jsonify({"success": True})
 
-# ── Plaid routes ──────────────────────────────────────────────────────────────
+# ── Plaid routes ─────────────────────────────────────────────────────────────
 PLAID_REDIRECT_URI = "https://evernest-swz9.onrender.com/plaid/oauth-return"
 
 @app.route("/plaid/create_link_token", methods=["POST"])
@@ -2461,7 +2434,7 @@ def plaid_oauth_return():
     return html, 200, {"Content-Type": "text/html"}
 
 
-# ── Plaid Link event logging ──────────────────────────────────────────────────
+# ── Plaid Link event logging ────────────────────────────────────────────────
 @app.route("/plaid/log_link_event", methods=["POST"])
 def log_link_event():
     """Log frontend Link events for conversion monitoring."""
@@ -2486,7 +2459,7 @@ def log_link_event():
     return "", 200
 
 
-# ── Plaid webhook ────────────────────────────────────────────────────────────
+# ── Plaid webhook ───────────────────────────────────────────────────────────
 @app.route("/plaid/webhook", methods=["POST"])
 def plaid_webhook():
     """Handle Plaid webhook events.
