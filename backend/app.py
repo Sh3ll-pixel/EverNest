@@ -1,5 +1,6 @@
 import os
 import datetime
+import secrets
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
@@ -262,6 +263,23 @@ def email_family_member_joined(owner_email, owner_name, new_member_name, family_
         """
     ))
 
+def email_password_reset(username, email, reset_url):
+    send_email(email, "Password Reset — EverNest", _email_wrap(
+        "Reset Your Password",
+        f"""
+        <p style="color:#d1d5db;">Hi {username},</p>
+        <p style="color:#d1d5db;">We received a request to reset your EverNest password. Click the button below to set a new one:</p>
+        <div style="text-align:center;margin:24px 0;">
+          <a href="{reset_url}" style="display:inline-block;background:#5b6ef7;color:#ffffff;
+             text-decoration:none;padding:12px 32px;border-radius:8px;font-weight:600;font-size:14px;">
+             Reset Password
+          </a>
+        </div>
+        <p style="color:#9ca3af;font-size:12px;">This link expires in 1 hour. If you didn't request a password reset, you can safely ignore this email.</p>
+        <p style="color:#4b5563;font-size:11px;">Or copy this link: {reset_url}</p>
+        """
+    ))
+
 # ── Database models ───────────────────────────────────────────────────────────
 class User(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
@@ -277,6 +295,8 @@ class User(db.Model):
     stripe_customer_id     = db.Column(db.String(100), nullable=True)
     paypal_subscription_id = db.Column(db.String(100), nullable=True)
     profile_picture        = db.Column(db.Text, nullable=True)  # base64 JPEG, max ~200KB
+    reset_token            = db.Column(db.String(100), nullable=True)
+    reset_token_exp        = db.Column(db.DateTime, nullable=True)
 
 
 def find_user_by_id(user_id):
@@ -2070,6 +2090,147 @@ def login():
     }
 }), 200
 
+# ── Password Reset ───────────────────────────────────────────────────────────
+
+@app.route("/auth/forgot-password", methods=["POST"])
+def forgot_password():
+    data  = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"success": False, "message": "Email is required"}), 400
+
+    user = User.query.filter(db.func.lower(User.email) == email).first()
+    if not user:
+        # Don't reveal whether email exists
+        return jsonify({"success": True, "message": "If that email is registered, a reset link has been sent."})
+
+    # Generate token
+    token = secrets.token_urlsafe(32)
+    user.reset_token     = token
+    user.reset_token_exp = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    db.session.commit()
+
+    reset_url = f"https://evernest-swz9.onrender.com/auth/reset-password?token={token}"
+    email_password_reset(user.username, user.email, reset_url)
+
+    return jsonify({"success": True, "message": "If that email is registered, a reset link has been sent."})
+
+
+@app.route("/auth/reset-password", methods=["GET"])
+def reset_password_page():
+    token = request.args.get("token", "")
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Reset Password - EverNest</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                   background: #0c0e14; color: #e5e7eb; display: flex;
+                   justify-content: center; align-items: center; height: 100vh; }
+            .card { background: #161a1f; border: 1px solid #2a2f38; border-radius: 12px;
+                    padding: 40px; width: 380px; }
+            .card h2 { color: #8b9cf7; margin-bottom: 8px; font-size: 20px; }
+            .card p { color: #4b5563; font-size: 13px; margin-bottom: 20px; }
+            input { width: 100%; padding: 12px 16px; border-radius: 8px;
+                    border: 1px solid #2a2f38; background: #0c0e14; color: #e5e7eb;
+                    font-size: 14px; margin-bottom: 12px; outline: none; }
+            input:focus { border-color: #5b6ef7; }
+            button { width: 100%; padding: 12px; border-radius: 8px; border: none;
+                     background: #5b6ef7; color: #fff; font-size: 14px;
+                     font-weight: 600; cursor: pointer; }
+            button:hover { background: #4a5ce0; }
+            button:disabled { background: #363C45; cursor: not-allowed; }
+            .msg { padding: 10px; border-radius: 8px; margin-top: 12px; font-size: 13px; text-align: center; }
+            .msg-ok { background: #0f2918; color: #4ade80; border: 1px solid #166534; }
+            .msg-err { background: #2a1520; color: #f87171; border: 1px solid #7f1d1d; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>Reset Password</h2>
+            <p>Enter your new password below.</p>
+            <input type="password" id="pw1" placeholder="New password" />
+            <input type="password" id="pw2" placeholder="Confirm new password" />
+            <button id="btn" onclick="doReset()">Reset Password</button>
+            <div id="msg"></div>
+        </div>
+        <script>
+            function doReset() {
+                const pw1 = document.getElementById('pw1').value;
+                const pw2 = document.getElementById('pw2').value;
+                if (!pw1 || pw1.length < 6) {
+                    document.getElementById('msg').innerHTML = '<div class="msg msg-err">Password must be at least 6 characters</div>';
+                    return;
+                }
+                if (pw1 !== pw2) {
+                    document.getElementById('msg').innerHTML = '<div class="msg msg-err">Passwords do not match</div>';
+                    return;
+                }
+                document.getElementById('btn').disabled = true;
+                document.getElementById('btn').textContent = 'Resetting...';
+                fetch('/auth/reset-password', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token: '""" + token + """', password: pw1})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('msg').innerHTML = '<div class="msg msg-ok">' + data.message + '</div>';
+                        document.getElementById('btn').textContent = 'Done!';
+                    } else {
+                        document.getElementById('msg').innerHTML = '<div class="msg msg-err">' + data.message + '</div>';
+                        document.getElementById('btn').disabled = false;
+                        document.getElementById('btn').textContent = 'Reset Password';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('msg').innerHTML = '<div class="msg msg-err">Something went wrong. Try again.</div>';
+                    document.getElementById('btn').disabled = false;
+                    document.getElementById('btn').textContent = 'Reset Password';
+                });
+            }
+            document.getElementById('pw2').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') doReset();
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/auth/reset-password", methods=["POST"])
+def reset_password():
+    data     = request.get_json() or {}
+    token    = data.get("token", "")
+    password = data.get("password", "")
+
+    if not token or not password:
+        return jsonify({"success": False, "message": "Token and password are required"}), 400
+
+    if len(password) < 6:
+        return jsonify({"success": False, "message": "Password must be at least 6 characters"}), 400
+
+    user = User.query.filter_by(reset_token=token).first()
+    if not user:
+        return jsonify({"success": False, "message": "Invalid or expired reset link"}), 400
+
+    if user.reset_token_exp and datetime.datetime.utcnow() > user.reset_token_exp:
+        return jsonify({"success": False, "message": "Reset link has expired. Request a new one."}), 400
+
+    user.password_hash  = bcrypt.generate_password_hash(password).decode("utf-8")
+    user.reset_token    = None
+    user.reset_token_exp = None
+    db.session.commit()
+
+    print(f"[AUTH] Password reset for {user.username} ({user.email})")
+    return jsonify({"success": True, "message": "Password updated! You can now log in with your new password."})
+
+
 # ── Settings Routes ──────────────────────────────────────────────────────────
  
 @app.route("/settings/update_profile", methods=["POST"])
@@ -3074,6 +3235,22 @@ def migrate_shopping():
             ))
             conn.commit()
         return "Shopping migration successful", 200
+    except Exception as e:
+        return str(e), 400
+
+
+@app.route("/migrate_auth")
+def migrate_auth():
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS reset_token VARCHAR(100)"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS reset_token_exp TIMESTAMP"
+            ))
+            conn.commit()
+        return "Auth migration successful", 200
     except Exception as e:
         return str(e), 400
 
