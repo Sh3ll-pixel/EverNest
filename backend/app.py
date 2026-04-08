@@ -358,6 +358,7 @@ def subscription_status():
         return jsonify({"subscribed": False}), 404
 
     cancel_at_period_end = False
+    shared_from = None
 
     # Check if subscription_end has passed
     if user.is_subscribed and user.subscription_end:
@@ -387,10 +388,32 @@ def subscription_status():
         except Exception as e:
             print(f"[SUB STATUS] Stripe check failed: {e}")
 
+    # If user is not subscribed, check if a family member is
+    if not user.is_subscribed:
+        try:
+            family, _ = get_user_family(user.id)
+            if family:
+                member_ids = get_family_member_ids(family.id)
+                for mid in member_ids:
+                    if mid == user.id:
+                        continue
+                    member = User.query.get(mid)
+                    if member and member.is_subscribed:
+                        # Family member has active subscription — grant access
+                        shared_from = member.username
+                        user.is_subscribed = True
+                        user.subscription_end = member.subscription_end
+                        db.session.commit()
+                        print(f"[SUB] Family share: {user.username} gets access via {member.username}")
+                        break
+        except Exception as e:
+            print(f"[SUB STATUS] Family check failed: {e}")
+
     return jsonify({
         "subscribed":           user.is_subscribed or False,
         "subscription_end":     user.subscription_end.isoformat() if user.subscription_end else None,
         "cancel_at_period_end": cancel_at_period_end,
+        "shared_from":          shared_from,
     })
 
 
@@ -1140,8 +1163,9 @@ class Note(db.Model):
     user_id          = db.Column(db.String(80), nullable=False)
     title            = db.Column(db.String(200), default="Untitled")
     body             = db.Column(db.Text, default="")
-    note_type        = db.Column(db.String(20), default="note")   # "note" or "checklist"
-    checklist_items  = db.Column(db.Text, default="[]")            # JSON string
+    note_type        = db.Column(db.String(20), default="note")
+    checklist_items  = db.Column(db.Text, default="[]")
+    family_shared    = db.Column(db.Boolean, default=False)
     updated_at       = db.Column(db.DateTime, default=datetime.datetime.utcnow,
                                   onupdate=datetime.datetime.utcnow)
     
@@ -1150,15 +1174,42 @@ class Note(db.Model):
 @require_auth
 def get_notes():
     user_id = request.args.get("user_id", "")
-    notes   = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
-    return jsonify({"notes": [{
-        "id":               n.id,
-        "title":            n.title,
-        "body":             n.body,
-        "note_type":        n.note_type,
-        "checklist_items":  json.loads(n.checklist_items or "[]"),
-        "updated_at":       n.updated_at.isoformat() if n.updated_at else "",
-    } for n in notes]})
+
+    # Own notes
+    own_notes = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
+
+    # Family shared notes from other members
+    family_notes = []
+    try:
+        uid = int(user_id)
+        family, _ = get_user_family(uid)
+        if family:
+            member_ids = get_family_member_ids(family.id)
+            for mid in member_ids:
+                if str(mid) != str(user_id):
+                    shared = Note.query.filter_by(user_id=str(mid), family_shared=True).all()
+                    family_notes.extend(shared)
+    except Exception:
+        pass
+
+    all_notes = own_notes + family_notes
+    all_notes.sort(key=lambda n: n.updated_at or datetime.datetime.min, reverse=True)
+
+    result = []
+    for n in all_notes:
+        creator = User.query.get(int(n.user_id)) if n.user_id.isdigit() else None
+        result.append({
+            "id":               n.id,
+            "title":            n.title,
+            "body":             n.body,
+            "note_type":        n.note_type,
+            "checklist_items":  json.loads(n.checklist_items or "[]"),
+            "updated_at":       n.updated_at.isoformat() if n.updated_at else "",
+            "family_shared":    getattr(n, 'family_shared', False) or False,
+            "created_by":       creator.username if creator else "",
+            "is_mine":          str(n.user_id) == str(user_id),
+        })
+    return jsonify({"notes": result})
  
  
 @app.route("/notes", methods=["POST"])
@@ -1171,6 +1222,7 @@ def create_note():
         body            = data.get("body", ""),
         note_type       = data.get("note_type", "note"),
         checklist_items = json.dumps(data.get("checklist_items", [])),
+        family_shared   = data.get("family_shared", False),
         updated_at      = datetime.datetime.utcnow(),
     )
     db.session.add(note)
@@ -1182,6 +1234,7 @@ def create_note():
         "note_type":       note.note_type,
         "checklist_items": json.loads(note.checklist_items),
         "updated_at":      note.updated_at.isoformat(),
+        "family_shared":   note.family_shared or False,
     }}), 201
  
  
@@ -1196,6 +1249,7 @@ def update_note(note_id):
     note.body            = data.get("body", note.body)
     note.note_type       = data.get("note_type", note.note_type)
     note.checklist_items = json.dumps(data.get("checklist_items", []))
+    note.family_shared   = data.get("family_shared", note.family_shared)
     note.updated_at      = datetime.datetime.utcnow()
     db.session.commit()
     return jsonify({"success": True})
@@ -1593,6 +1647,28 @@ try:
     plaid_client = plaid_api.PlaidApi(api_client)
 except Exception as e:
     print(f"Warning: Plaid client init failed ({e}). Plaid routes will be unavailable.")
+
+# ── Plaid API cache — prevents users from running up Plaid fees ──────────
+# Cache format: { "balance:{user_id}": {"data": ..., "time": datetime}, ... }
+_plaid_cache = {}
+BALANCE_CACHE_SECONDS = 900      # 15 minutes
+TRANSACTIONS_CACHE_SECONDS = 1800  # 30 minutes
+
+
+def _get_cache(key, max_age_seconds):
+    """Return cached data if it exists and isn't expired, else None."""
+    entry = _plaid_cache.get(key)
+    if entry:
+        age = (datetime.datetime.utcnow() - entry["time"]).total_seconds()
+        if age < max_age_seconds:
+            print(f"[PLAID CACHE] Hit for {key} (age={int(age)}s)")
+            return entry["data"]
+    return None
+
+
+def _set_cache(key, data):
+    """Store data in cache with current timestamp."""
+    _plaid_cache[key] = {"data": data, "time": datetime.datetime.utcnow()}
 
 
 # ── Core routes ─────────────────────────────────────────────────────────────
@@ -2518,7 +2594,13 @@ def get_accounts():
         except (ValueError, TypeError):
             user = find_user_by_id(user_id)
             member_ids = [user.id] if user else []
- 
+
+        # Check cache first
+        cache_key = f"accounts:{','.join(str(m) for m in sorted(member_ids))}"
+        cached = _get_cache(cache_key, BALANCE_CACHE_SECONDS)
+        if cached:
+            return jsonify({"accounts": cached, "cached": True})
+
         all_accounts = []
         for uid in member_ids:
             u = User.query.get(uid)
@@ -2536,7 +2618,8 @@ def get_accounts():
                     all_accounts.extend(accounts)
                 except Exception as e:
                     print(f"[PLAID] accounts_get FAILED | user={uid} | error={e}")
- 
+
+        _set_cache(cache_key, all_accounts)
         return jsonify({"accounts": all_accounts})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -2545,16 +2628,19 @@ def get_accounts():
 @app.route("/plaid/balance", methods=["GET"])
 @require_auth
 def get_realtime_balance():
-    """Fetch real-time balance data using /accounts/balance/get.
-    Unlike /plaid/accounts which returns cached data, this makes a live
-    request to the financial institution for up-to-date balances.
-    """
+    """Fetch balance data with 15-minute cache to limit Plaid API costs."""
     try:
         user_id = request.args.get("user_id")
         user = find_user_by_id(user_id)
 
         if not user or not user.plaid_access_token:
             return jsonify({"accounts": [], "error": "No bank account connected"}), 400
+
+        # Check cache first
+        cache_key = f"balance:{user.id}"
+        cached = _get_cache(cache_key, BALANCE_CACHE_SECONDS)
+        if cached:
+            return jsonify({"accounts": cached, "cached": True})
 
         req = AccountsBalanceGetRequest(access_token=user.plaid_access_token)
         response = plaid_client.accounts_balance_get(req)
@@ -2566,6 +2652,7 @@ def get_realtime_balance():
         for acct in accounts:
             acct["owner"] = user.username
 
+        _set_cache(cache_key, accounts)
         print(f"[PLAID] balance_get | user={user_id} | accounts={account_ids} | request_id={request_id}")
         return jsonify({"accounts": accounts})
 
@@ -2580,7 +2667,7 @@ def get_realtime_balance():
 @app.route("/plaid/transactions", methods=["GET"])
 @require_auth
 def get_transactions():
-    """Fetch transactions with proper pagination as required by Plaid."""
+    """Fetch transactions with 30-minute cache to limit Plaid API costs."""
     try:
         user_id = request.args.get("user_id")
         days    = request.args.get("days", 30, type=int)
@@ -2588,6 +2675,13 @@ def get_transactions():
 
         if not user or not user.plaid_access_token:
             return jsonify({"transactions": []})
+
+        # Check cache first
+        cache_key = f"txn:{user.id}:{days}"
+        cached = _get_cache(cache_key, TRANSACTIONS_CACHE_SECONDS)
+        if cached:
+            return jsonify({"transactions": cached["transactions"],
+                            "total": cached["total"], "cached": True})
 
         end_date   = datetime.date.today()
         start_date = end_date - datetime.timedelta(days=days)
@@ -2631,6 +2725,7 @@ def get_transactions():
                 break
 
         print(f"[PLAID TXN] Fetched {len(all_transactions)}/{total_transactions} transactions for user {user_id}")
+        _set_cache(cache_key, {"transactions": all_transactions, "total": total_transactions})
         return jsonify({
             "transactions": all_transactions,
             "total": total_transactions,
@@ -3248,6 +3343,9 @@ def migrate_auth():
             ))
             conn.execute(db.text(
                 "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS reset_token_exp TIMESTAMP"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE note ADD COLUMN IF NOT EXISTS family_shared BOOLEAN DEFAULT FALSE"
             ))
             conn.commit()
         return "Auth migration successful", 200
