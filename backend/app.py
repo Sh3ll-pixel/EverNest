@@ -1754,8 +1754,8 @@ def admin_panel():
         <div class="login-wrap" id="loginView">
             <div class="login-card">
                 <h2>EverNest Admin</h2>
-                <p>Enter your admin key to continue</p>
-                <input type="password" id="adminKeyInput" placeholder="Admin Key (SECRET_KEY)">
+                <p>Enter your admin password to continue</p>
+                <input type="password" id="adminKeyInput" placeholder="Admin Password">
                 <button class="btn-primary" onclick="doLogin()">Sign In</button>
                 <div id="loginMsg"></div>
             </div>
@@ -1836,7 +1836,7 @@ def admin_panel():
                 })
                 .catch(() => {
                     document.getElementById('loginMsg').innerHTML =
-                        '<div class="msg msg-err">Invalid admin key</div>';
+                        '<div class="msg msg-err">Invalid admin password</div>';
                 });
             }
 
@@ -1955,8 +1955,9 @@ def admin_panel():
 
 
 def _admin_auth(data):
-    """Verify admin key from request body. Returns True if valid."""
-    return data.get("admin_key", "") == app.config["SECRET_KEY"]
+    """Verify admin password from request body. Returns True if valid."""
+    admin_pw = os.environ.get("ADMIN_PASSWORD", app.config["SECRET_KEY"])
+    return data.get("admin_key", "") == admin_pw
 
 
 @app.route("/admin/users", methods=["POST"])
