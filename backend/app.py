@@ -1176,7 +1176,12 @@ def get_notes():
     user_id = request.args.get("user_id", "")
 
     # Own notes
-    own_notes = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
+    try:
+        own_notes = Note.query.filter_by(user_id=user_id).order_by(Note.updated_at.desc()).all()
+    except Exception as e:
+        print(f"[NOTES] Query failed (run /migrate_auth?): {e}")
+        db.session.rollback()
+        return jsonify({"notes": [], "error": "Run /migrate_auth to fix notes"}), 200
 
     # Family shared notes from other members
     family_notes = []
@@ -1187,8 +1192,11 @@ def get_notes():
             member_ids = get_family_member_ids(family.id)
             for mid in member_ids:
                 if str(mid) != str(user_id):
-                    shared = Note.query.filter_by(user_id=str(mid), family_shared=True).all()
-                    family_notes.extend(shared)
+                    try:
+                        shared = Note.query.filter_by(user_id=str(mid), family_shared=True).all()
+                        family_notes.extend(shared)
+                    except Exception:
+                        pass  # family_shared column may not exist yet
     except Exception:
         pass
 
