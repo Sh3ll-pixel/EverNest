@@ -592,7 +592,7 @@ def subscription_success():
           <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
           Close this tab and click <b>Refresh</b> in EverNest.</p>
         </div></body></html>
-        """, 200, {"Content-Type": "text/html"}
+        """, 200, {"Content-Type": "text/html; charset=utf-8"}
     else:
         return """
         <html><body style="background:#23272D;color:#96abff;font-family:Arial;
@@ -603,7 +603,7 @@ def subscription_success():
           <p style="color:#9A9A9A;">Your payment is being confirmed.<br>
           Close this tab, wait a moment, then click <b>Refresh</b> in EverNest.</p>
         </div></body></html>
-        """, 200, {"Content-Type": "text/html"}
+        """, 200, {"Content-Type": "text/html; charset=utf-8"}
  
  
 @app.route("/subscription/cancel")
@@ -617,7 +617,7 @@ def subscription_cancel():
       <p style="color:#9A9A9A;">No charges were made.<br>
       Close this tab and try again from EverNest.</p>
     </div></body></html>
-    """, 200, {"Content-Type": "text/html"}
+    """, 200, {"Content-Type": "text/html; charset=utf-8"}
  
  
 # ── PayPal: create subscription ───────────────────────────────────────────
@@ -717,7 +717,7 @@ def paypal_success():
       <p style="color:#9A9A9A;">You now have full access to EverNest Pro.<br>
       Close this tab and reopen the app to get started.</p>
     </div></body></html>
-    """, 200, {"Content-Type": "text/html"}
+    """, 200, {"Content-Type": "text/html; charset=utf-8"}
  
  
 # ── Daily job: expire lapsed subscriptions ────────────────────────────────
@@ -1690,6 +1690,7 @@ def admin_panel():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="UTF-8">
         <title>EverNest Admin</title>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1951,7 +1952,7 @@ def admin_panel():
     </body>
     </html>
     """
-    return html, 200, {"Content-Type": "text/html"}
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 def _admin_auth(data):
@@ -2201,6 +2202,7 @@ def reset_password_page():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="UTF-8">
         <title>Reset Password - EverNest</title>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2277,7 +2279,7 @@ def reset_password_page():
     </body>
     </html>
     """
-    return html, 200, {"Content-Type": "text/html"}
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/auth/reset-password", methods=["POST"])
@@ -2890,6 +2892,7 @@ def plaid_link_page():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="UTF-8">
         <title>Connect Bank - EverNest</title>
         <style>
             body { font-family: Arial, sans-serif; background: #23272D; color: #96abff;
@@ -2986,7 +2989,7 @@ def plaid_link_page():
     </body>
     </html>
     """
-    return html, 200, {"Content-Type": "text/html"}
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/plaid/oauth-return")
@@ -2998,6 +3001,7 @@ def plaid_oauth_return():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="UTF-8">
         <title>Connecting Bank - EverNest</title>
         <style>
             body { font-family: Arial, sans-serif; background: #0c0e14; color: #8b9cf7;
@@ -3084,7 +3088,7 @@ def plaid_oauth_return():
     </body>
     </html>
     """
-    return html, 200, {"Content-Type": "text/html"}
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 # ── Plaid Link event logging ────────────────────────────────────────────────
