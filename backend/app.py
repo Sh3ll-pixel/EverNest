@@ -1841,6 +1841,7 @@ PLAID_COST_ESTIMATES = {
 _plaid_cache = {}             # Response cache
 _plaid_rate = {}              # Rate limit tracking: {user_id: {endpoint: [timestamps]}}
 _plaid_cost = {}              # Monthly cost tracking: {user_id: {month: total_cost}}
+_plaid_paused = set()         # User IDs with Plaid access frozen by admin
 
 
 def _get_month_key():
@@ -1911,8 +1912,14 @@ def _check_cost_ceiling(user_id):
 
 
 def _plaid_gate(user_id, endpoint):
-    """Combined rate limit + cost ceiling check. Returns (allowed, reason)."""
-    # Cost ceiling check first
+    """Combined pause check + rate limit + cost ceiling check. Returns (allowed, reason)."""
+    user_id = str(user_id)
+
+    # Admin pause check — overrides everything
+    if user_id in _plaid_paused:
+        return False, "Your bank access has been temporarily paused by an administrator."
+
+    # Cost ceiling check
     allowed, reason = _check_cost_ceiling(user_id)
     if not allowed:
         return False, reason
@@ -2211,32 +2218,82 @@ def admin_panel():
                 });
             }
 
+            let usersData = []; // Store for sorting
+            let sortField = 'id';
+            let sortDir = 'asc';
+
             function listAllUsers() {
                 adminFetch('/admin/users', {}).then(data => {
                     if (!data.users) return;
-                    let html = '<table><tr><th>ID</th><th>Username</th><th>Email</th>' +
-                               '<th>Status</th><th>Ends</th><th>Actions</th></tr>';
-                    data.users.forEach(u => {
-                        let badge = '';
-                        if (u.is_subscribed && u.cancel_at_period_end)
-                            badge = '<span class="badge badge-cancelled">Cancelled</span>';
-                        else if (u.is_subscribed)
-                            badge = '<span class="badge badge-active">Active</span>';
-                        else
-                            badge = '<span class="badge badge-inactive">Free</span>';
-
-                        let end = u.subscription_end ? u.subscription_end.substring(0, 10) : '\\u2014';
-                        html += '<tr><td>' + u.id + '</td><td>' + u.username +
-                                '</td><td>' + u.email + '</td><td>' + badge +
-                                '</td><td>' + end + '</td><td>' +
-                                '<button class="btn-success btn-sm" onclick="quickGrant(\\''+u.email+'\\')">Grant</button> ' +
-                                '<button class="btn-danger btn-sm" onclick="quickRevoke(\\''+u.email+'\\')">Revoke</button> ' +
-                                '<button class="btn-sm" style="background:#1e2a42;color:#7B93DB;" onclick="resetRateLimit(\\''+u.id+'\\',\\''+u.username+'\\')">Reset Limits</button>' +
-                                '</td></tr>';
-                    });
-                    html += '</table>';
-                    document.getElementById('usersTable').innerHTML = html;
+                    usersData = data.users;
+                    renderUsersTable();
                 });
+            }
+
+            function sortUsers(field) {
+                if (sortField === field) {
+                    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortField = field;
+                    sortDir = field === 'plaid_cost' ? 'desc' : 'asc'; // Cost defaults high-first
+                }
+                renderUsersTable();
+            }
+
+            function renderUsersTable() {
+                let sorted = [...usersData];
+                sorted.sort((a, b) => {
+                    let va = a[sortField] || 0;
+                    let vb = b[sortField] || 0;
+                    if (typeof va === 'string') va = va.toLowerCase();
+                    if (typeof vb === 'string') vb = vb.toLowerCase();
+                    if (va < vb) return sortDir === 'asc' ? -1 : 1;
+                    if (va > vb) return sortDir === 'asc' ? 1 : -1;
+                    return 0;
+                });
+
+                let arrow = sortDir === 'asc' ? ' \\u25B2' : ' \\u25BC';
+                let html = '<table><tr>' +
+                    '<th style="cursor:pointer" onclick="sortUsers(\\'id\\')">ID' + (sortField==='id'?arrow:'') + '</th>' +
+                    '<th style="cursor:pointer" onclick="sortUsers(\\'username\\')">Username' + (sortField==='username'?arrow:'') + '</th>' +
+                    '<th>Email</th>' +
+                    '<th>Status</th>' +
+                    '<th style="cursor:pointer" onclick="sortUsers(\\'plaid_cost\\')">Cost' + (sortField==='plaid_cost'?arrow:'') + '</th>' +
+                    '<th>Ends</th>' +
+                    '<th>Actions</th></tr>';
+
+                sorted.forEach(u => {
+                    let badge = '';
+                    if (u.is_subscribed && u.cancel_at_period_end)
+                        badge = '<span class="badge badge-cancelled">Cancelled</span>';
+                    else if (u.is_subscribed)
+                        badge = '<span class="badge badge-active">Active</span>';
+                    else
+                        badge = '<span class="badge badge-inactive">Free</span>';
+
+                    let end = u.subscription_end ? u.subscription_end.substring(0, 10) : '\\u2014';
+
+                    let costColor = u.plaid_cost > 4 ? '#f87171' : u.plaid_cost > 2 ? '#fbbf24' : '#4ade80';
+                    let costStr = u.plaid_cost > 0 ? '<span style="color:'+costColor+'">$'+u.plaid_cost.toFixed(2)+'</span>' : '<span style="color:#4b5563">$0</span>';
+
+                    let pauseBtn = u.plaid_paused ?
+                        '<button class="btn-sm" style="background:#2a4a2a;color:#4ade80;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;" onclick="togglePause(\\''+u.id+'\\',\\'unpause\\',\\''+u.username+'\\')">Resume</button>' :
+                        '<button class="btn-sm" style="background:#4a2a2a;color:#f87171;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;" onclick="togglePause(\\''+u.id+'\\',\\'pause\\',\\''+u.username+'\\')">Pause</button>';
+
+                    let pauseTag = u.plaid_paused ? ' <span style="color:#f87171;font-size:10px;">PAUSED</span>' : '';
+
+                    html += '<tr><td>' + u.id + '</td><td>' + u.username + pauseTag +
+                            '</td><td>' + u.email + '</td><td>' + badge +
+                            '</td><td>' + costStr +
+                            '</td><td>' + end + '</td><td>' +
+                            '<button class="btn-success btn-sm" onclick="quickGrant(\\''+u.email+'\\')">Grant</button> ' +
+                            '<button class="btn-danger btn-sm" onclick="quickRevoke(\\''+u.email+'\\')">Revoke</button> ' +
+                            '<button class="btn-sm" style="background:#1e2a42;color:#7B93DB;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;" onclick="resetRateLimit(\\''+u.id+'\\',\\''+u.username+'\\')">Reset</button> ' +
+                            pauseBtn +
+                            '</td></tr>';
+                });
+                html += '</table>';
+                document.getElementById('usersTable').innerHTML = html;
             }
 
             function renderUserCard(u) {
@@ -2285,6 +2342,20 @@ def admin_panel():
             }
             function quickRevoke(email) {
                 adminFetch('/admin/revoke_subscription', {email: email}).then(() => listAllUsers());
+            }
+
+            function togglePause(userId, action, username) {
+                let msg = action === 'pause' ?
+                    'Pause Plaid access for ' + username + '? They will not be able to refresh bank data.' :
+                    'Resume Plaid access for ' + username + '?';
+                if (!confirm(msg)) return;
+                adminFetch('/admin/pause_plaid', {user_id: userId, action: action}).then(data => {
+                    document.getElementById('plaidMsg').innerHTML = data.success ?
+                        '<div class="msg msg-ok">' + data.message + '</div>' :
+                        '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    listAllUsers();
+                    loadPlaidCosts();
+                });
             }
 
             function resetRateLimit(userId, username) {
@@ -2373,6 +2444,8 @@ def admin_list_users():
             "stripe_customer_id": u.stripe_customer_id,
             "plaid_access_token": bool(u.plaid_access_token),
             "cancel_at_period_end": cancel,
+            "plaid_cost": round(_plaid_cost.get(str(u.id), {}).get(_get_month_key(), 0), 2),
+            "plaid_paused": str(u.id) in _plaid_paused,
         })
     return jsonify({"users": result})
 
@@ -2654,6 +2727,29 @@ def admin_reset_rate_limit():
 
     print(f"[AUDIT] ADMIN_RESET_RATE | user_id={user_id} | ip={request.remote_addr}")
     return jsonify({"success": True, "message": f"Rate limits and costs reset for user {user_id}"})
+
+
+@app.route("/admin/pause_plaid", methods=["POST"])
+def admin_pause_plaid():
+    """Pause or unpause a user's Plaid API access."""
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    user_id = str(data.get("user_id", ""))
+    action = data.get("action", "pause")  # "pause" or "unpause"
+
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+
+    if action == "pause":
+        _plaid_paused.add(user_id)
+        print(f"[AUDIT] ADMIN_PAUSE_PLAID | user_id={user_id} | ip={request.remote_addr}")
+        return jsonify({"success": True, "message": f"Plaid access paused for user {user_id}"})
+    else:
+        _plaid_paused.discard(user_id)
+        print(f"[AUDIT] ADMIN_UNPAUSE_PLAID | user_id={user_id} | ip={request.remote_addr}")
+        return jsonify({"success": True, "message": f"Plaid access resumed for user {user_id}"})
 
 
 @app.route("/admin/change_email", methods=["POST"])
