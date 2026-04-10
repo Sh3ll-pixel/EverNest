@@ -1643,7 +1643,19 @@ def debug_calendar_events():
     } for e in events]})
 
 with app.app_context():
-    db.create_all()
+    import time as _time
+    for _attempt in range(5):
+        try:
+            db.create_all()
+            print("[DB] Connected and tables verified")
+            break
+        except Exception as _e:
+            print(f"[DB] Connection attempt {_attempt + 1}/5 failed: {_e}")
+            if _attempt < 4:
+                _time.sleep(3 * (_attempt + 1))  # 3s, 6s, 9s, 12s backoff
+            else:
+                print("[DB] Could not connect after 5 attempts — starting anyway")
+                # Don't crash — let requests retry on their own
 
 
 # ── Plaid client setup ──────────────────────────────────────────────────────
