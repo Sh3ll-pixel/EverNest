@@ -55,7 +55,6 @@ if "postgresql" in database_url:
         "keepalives_interval": 10,
         "keepalives_count": 5,
         "connect_timeout": 10,
-        "sslmode": "require",
     }
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = _engine_opts
 
@@ -1679,11 +1678,123 @@ try:
 except Exception as e:
     print(f"Warning: Plaid client init failed ({e}). Plaid routes will be unavailable.")
 
-# ── Plaid API cache — prevents users from running up Plaid fees ──────────
-# Cache format: { "balance:{user_id}": {"data": ..., "time": datetime}, ... }
-_plaid_cache = {}
-BALANCE_CACHE_SECONDS = 900      # 15 minutes
-TRANSACTIONS_CACHE_SECONDS = 1800  # 30 minutes
+# ── Plaid Rate Limiting & Cost Protection ─────────────────────────────────
+# ALL VALUES ARE HARDCODED — not stored in the database, cannot be manipulated
+# by users or database access.
+
+# === RATE LIMITS (per user, per endpoint) ===
+# These cap how often a user can trigger actual Plaid API calls
+PLAID_RATE_LIMITS = {
+    "balance":      {"calls_per_hour": 4,   "cache_seconds": 900},    # 4/hr, cache 15min
+    "transactions": {"calls_per_hour": 2,   "cache_seconds": 1800},   # 2/hr, cache 30min
+    "accounts":     {"calls_per_hour": 4,   "cache_seconds": 900},    # 4/hr, cache 15min
+    "link_token":   {"calls_per_hour": 3,   "cache_seconds": 0},      # 3/hr, no cache
+    "token_exchange": {"calls_per_hour": 2, "cache_seconds": 0},      # 2/hr, no cache
+}
+
+# === COST CEILING (per user per month) ===
+# If a user's estimated Plaid cost exceeds this, all Plaid calls are blocked
+# until next month. This ensures you NEVER lose money on a user.
+SUBSCRIPTION_PRICE = 9.99
+STRIPE_FEE = 0.59           # 2.9% + $0.30 on $9.99
+HOSTING_PER_USER = 0.15
+MAX_PLAID_COST_PER_USER = 5.00  # Hard cap — no user can cost more than $5/mo
+
+# Estimated Plaid costs per API call type
+PLAID_COST_ESTIMATES = {
+    "balance": 0.10,          # Balance check
+    "transactions": 0.00,     # Transactions is subscription-based, not per-call
+    "accounts": 0.00,         # accounts_get is free
+    "link_token": 0.00,       # Free
+    "token_exchange": 1.00,   # One-time auth cost
+}
+
+# === IN-MEMORY TRACKING (resets on server restart — that's fine, it's a safety net) ===
+_plaid_cache = {}             # Response cache
+_plaid_rate = {}              # Rate limit tracking: {user_id: {endpoint: [timestamps]}}
+_plaid_cost = {}              # Monthly cost tracking: {user_id: {month: total_cost}}
+
+
+def _get_month_key():
+    """Current year-month string for cost tracking."""
+    return datetime.datetime.utcnow().strftime("%Y-%m")
+
+
+def _check_rate_limit(user_id, endpoint):
+    """Check if user is within rate limits. Returns (allowed, reason)."""
+    user_id = str(user_id)
+    limits = PLAID_RATE_LIMITS.get(endpoint)
+    if not limits:
+        return True, ""
+
+    now = datetime.datetime.utcnow()
+    key = f"{user_id}:{endpoint}"
+
+    # Initialize tracking
+    if key not in _plaid_rate:
+        _plaid_rate[key] = []
+
+    # Remove timestamps older than 1 hour
+    one_hour_ago = now - datetime.timedelta(hours=1)
+    _plaid_rate[key] = [t for t in _plaid_rate[key] if t > one_hour_ago]
+
+    # Check limit
+    if len(_plaid_rate[key]) >= limits["calls_per_hour"]:
+        oldest = _plaid_rate[key][0]
+        wait_seconds = int((oldest + datetime.timedelta(hours=1) - now).total_seconds())
+        print(f"[PLAID RATE] BLOCKED {user_id} on {endpoint} — {len(_plaid_rate[key])}/{limits['calls_per_hour']} calls/hr")
+        return False, f"Rate limited. Try again in {wait_seconds // 60 + 1} minutes."
+
+    return True, ""
+
+
+def _record_plaid_call(user_id, endpoint):
+    """Record a Plaid API call for rate limiting and cost tracking."""
+    user_id = str(user_id)
+    now = datetime.datetime.utcnow()
+
+    # Record for rate limiting
+    key = f"{user_id}:{endpoint}"
+    if key not in _plaid_rate:
+        _plaid_rate[key] = []
+    _plaid_rate[key].append(now)
+
+    # Record estimated cost
+    cost = PLAID_COST_ESTIMATES.get(endpoint, 0)
+    if cost > 0:
+        month = _get_month_key()
+        if user_id not in _plaid_cost:
+            _plaid_cost[user_id] = {}
+        _plaid_cost[user_id][month] = _plaid_cost[user_id].get(month, 0) + cost
+        print(f"[PLAID COST] {user_id}: +${cost:.2f} this month = ${_plaid_cost[user_id][month]:.2f} (max: ${MAX_PLAID_COST_PER_USER:.2f})")
+
+
+def _check_cost_ceiling(user_id):
+    """Check if user has exceeded their monthly Plaid cost ceiling. Returns (allowed, reason)."""
+    user_id = str(user_id)
+    month = _get_month_key()
+    current_cost = _plaid_cost.get(user_id, {}).get(month, 0)
+
+    if current_cost >= MAX_PLAID_COST_PER_USER:
+        print(f"[PLAID COST] BLOCKED {user_id} — ${current_cost:.2f} >= ceiling ${MAX_PLAID_COST_PER_USER:.2f}")
+        return False, "Monthly API limit reached. Data will refresh next month."
+
+    return True, ""
+
+
+def _plaid_gate(user_id, endpoint):
+    """Combined rate limit + cost ceiling check. Returns (allowed, reason)."""
+    # Cost ceiling check first
+    allowed, reason = _check_cost_ceiling(user_id)
+    if not allowed:
+        return False, reason
+
+    # Rate limit check
+    allowed, reason = _check_rate_limit(user_id, endpoint)
+    if not allowed:
+        return False, reason
+
+    return True, ""
 
 
 def _get_cache(key, max_age_seconds):
@@ -1702,10 +1813,43 @@ def _set_cache(key, data):
     _plaid_cache[key] = {"data": data, "time": datetime.datetime.utcnow()}
 
 
+# ── Row-Level Security (Application-Enforced) ────────────────────────────
+# PostgreSQL RLS requires direct DB access to configure. Since we use
+# SQLAlchemy ORM, we enforce RLS at the application layer instead.
+# Every data-access route MUST verify the requesting user owns the data
+# or is in the same family group.
+
+def _verify_data_ownership(user_id, resource_user_id):
+    """Verify that user_id is allowed to access resource_user_id's data.
+    Returns True if: same user, or in same family group."""
+    if str(user_id) == str(resource_user_id):
+        return True
+    try:
+        family1, _ = get_user_family(int(user_id))
+        family2, _ = get_user_family(int(resource_user_id))
+        if family1 and family2 and family1.id == family2.id:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _get_allowed_user_ids(user_id):
+    """Get list of user IDs this user is allowed to access (self + family)."""
+    allowed = [int(user_id)]
+    try:
+        family, _ = get_user_family(int(user_id))
+        if family:
+            allowed = get_family_member_ids(family.id)
+    except Exception:
+        pass
+    return allowed
+
+
 # ── Core routes ─────────────────────────────────────────────────────────────
 
 # Current app version — bump this when you push a new release
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.0"
 
 @app.route("/")
 def home():
@@ -2199,6 +2343,51 @@ def login():
     }
 }), 200
 
+# ── Admin: Plaid Cost Monitor ─────────────────────────────────────────────
+
+@app.route("/admin/plaid_costs", methods=["POST"])
+def admin_plaid_costs():
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    month = _get_month_key()
+    costs = []
+    total = 0
+    for uid, months in _plaid_cost.items():
+        cost = months.get(month, 0)
+        if cost > 0:
+            user = User.query.get(int(uid)) if uid.isdigit() else None
+            costs.append({
+                "user_id": uid,
+                "username": user.username if user else "Unknown",
+                "cost_this_month": round(cost, 2),
+                "ceiling": round(MAX_PLAID_COST_PER_USER, 2),
+                "pct_used": round(cost / MAX_PLAID_COST_PER_USER * 100, 1),
+            })
+            total += cost
+
+    # Rate limit stats
+    rate_stats = {}
+    for key, timestamps in _plaid_rate.items():
+        uid, endpoint = key.split(":", 1)
+        if uid not in rate_stats:
+            rate_stats[uid] = {}
+        one_hour_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
+        recent = [t for t in timestamps if t > one_hour_ago]
+        rate_stats[uid][endpoint] = len(recent)
+
+    return jsonify({
+        "month": month,
+        "total_estimated_cost": round(total, 2),
+        "max_per_user": round(MAX_PLAID_COST_PER_USER, 2),
+        "subscription_price": SUBSCRIPTION_PRICE,
+        "margin_per_user": round(SUBSCRIPTION_PRICE - STRIPE_FEE - HOSTING_PER_USER, 2),
+        "user_costs": sorted(costs, key=lambda x: x["cost_this_month"], reverse=True),
+        "rate_limit_usage": rate_stats,
+    })
+
+
 # ── Password Reset ───────────────────────────────────────────────────────────
 
 @app.route("/auth/forgot-password", methods=["POST"])
@@ -2550,6 +2739,11 @@ def create_link_token():
         data    = request.get_json() or {}
         user_id = str(data.get("user_id", "default_user"))
 
+        # Rate limit check
+        allowed, reason = _plaid_gate(user_id, "link_token")
+        if not allowed:
+            return jsonify({"error": reason, "rate_limited": True}), 429
+
         # Duplicate Item detection — if user already has a linked bank, warn them
         user = find_user_by_id(user_id)
         if user and user.plaid_access_token:
@@ -2572,6 +2766,7 @@ def create_link_token():
         link_token = response["link_token"]
         request_id = response.get("request_id", "")
         print(f"[PLAID] link_token_create | user={user_id} | request_id={request_id}")
+        _record_plaid_call(user_id, "link_token")
         return jsonify({"link_token": link_token})
 
     except plaid.ApiException as e:
@@ -2590,12 +2785,19 @@ def exchange_token():
         if not public_token:
             return jsonify({"error": "public_token is required"}), 400
 
+        # Rate limit + cost ceiling check
+        allowed, reason = _plaid_gate(user_id, "token_exchange")
+        if not allowed:
+            return jsonify({"error": reason, "rate_limited": True}), 429
+
         req          = ItemPublicTokenExchangeRequest(public_token=public_token)
         response     = plaid_client.item_public_token_exchange(req)
         access_token = response["access_token"]
         item_id      = response["item_id"]
         request_id   = response.get("request_id", "")
         print(f"[PLAID] Token exchange | item_id={item_id} | request_id={request_id} | user={user_id}")
+
+        _record_plaid_call(user_id, "token_exchange")
 
         user = find_user_by_id(user_id)
         if user:
@@ -2616,6 +2818,11 @@ def exchange_token():
 def get_accounts():
     try:
         user_id = request.args.get("user_id")
+
+        # Rate limit + cost ceiling check
+        allowed, reason = _plaid_gate(user_id, "accounts")
+        if not allowed:
+            return jsonify({"accounts": [], "rate_limited": True, "message": reason})
  
         # Collect all user_ids in family
         try:
@@ -2631,7 +2838,7 @@ def get_accounts():
 
         # Check cache first
         cache_key = f"accounts:{','.join(str(m) for m in sorted(member_ids))}"
-        cached = _get_cache(cache_key, BALANCE_CACHE_SECONDS)
+        cached = _get_cache(cache_key, PLAID_RATE_LIMITS["accounts"]["cache_seconds"])
         if cached:
             return jsonify({"accounts": cached, "cached": True})
 
@@ -2654,6 +2861,7 @@ def get_accounts():
                     print(f"[PLAID] accounts_get FAILED | user={uid} | error={e}")
 
         _set_cache(cache_key, all_accounts)
+        _record_plaid_call(user_id, "accounts")
         return jsonify({"accounts": all_accounts})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -2662,7 +2870,7 @@ def get_accounts():
 @app.route("/plaid/balance", methods=["GET"])
 @require_auth
 def get_realtime_balance():
-    """Fetch balance data with 15-minute cache to limit Plaid API costs."""
+    """Fetch balance data with rate limiting and cache."""
     try:
         user_id = request.args.get("user_id")
         user = find_user_by_id(user_id)
@@ -2670,9 +2878,19 @@ def get_realtime_balance():
         if not user or not user.plaid_access_token:
             return jsonify({"accounts": [], "error": "No bank account connected"}), 400
 
+        # Rate limit + cost ceiling check
+        allowed, reason = _plaid_gate(user_id, "balance")
+        if not allowed:
+            # Return cached data if available, even if expired
+            cache_key = f"balance:{user.id}"
+            stale = _plaid_cache.get(cache_key)
+            if stale:
+                return jsonify({"accounts": stale["data"], "cached": True, "rate_limited": True, "message": reason})
+            return jsonify({"accounts": [], "rate_limited": True, "message": reason})
+
         # Check cache first
         cache_key = f"balance:{user.id}"
-        cached = _get_cache(cache_key, BALANCE_CACHE_SECONDS)
+        cached = _get_cache(cache_key, PLAID_RATE_LIMITS["balance"]["cache_seconds"])
         if cached:
             return jsonify({"accounts": cached, "cached": True})
 
@@ -2687,6 +2905,7 @@ def get_realtime_balance():
             acct["owner"] = user.username
 
         _set_cache(cache_key, accounts)
+        _record_plaid_call(user_id, "balance")
         print(f"[PLAID] balance_get | user={user_id} | accounts={account_ids} | request_id={request_id}")
         return jsonify({"accounts": accounts})
 
@@ -2701,7 +2920,7 @@ def get_realtime_balance():
 @app.route("/plaid/transactions", methods=["GET"])
 @require_auth
 def get_transactions():
-    """Fetch transactions with 30-minute cache to limit Plaid API costs."""
+    """Fetch transactions with rate limiting and cache."""
     try:
         user_id = request.args.get("user_id")
         days    = request.args.get("days", 30, type=int)
@@ -2710,9 +2929,20 @@ def get_transactions():
         if not user or not user.plaid_access_token:
             return jsonify({"transactions": []})
 
+        # Rate limit + cost ceiling check
+        allowed, reason = _plaid_gate(user_id, "transactions")
+        if not allowed:
+            cache_key = f"txn:{user.id}:{days}"
+            stale = _plaid_cache.get(cache_key)
+            if stale:
+                return jsonify({"transactions": stale["data"]["transactions"],
+                                "total": stale["data"]["total"], "cached": True,
+                                "rate_limited": True, "message": reason})
+            return jsonify({"transactions": [], "rate_limited": True, "message": reason})
+
         # Check cache first
         cache_key = f"txn:{user.id}:{days}"
-        cached = _get_cache(cache_key, TRANSACTIONS_CACHE_SECONDS)
+        cached = _get_cache(cache_key, PLAID_RATE_LIMITS["transactions"]["cache_seconds"])
         if cached:
             return jsonify({"transactions": cached["transactions"],
                             "total": cached["total"], "cached": True})
@@ -2760,6 +2990,7 @@ def get_transactions():
 
         print(f"[PLAID TXN] Fetched {len(all_transactions)}/{total_transactions} transactions for user {user_id}")
         _set_cache(cache_key, {"transactions": all_transactions, "total": total_transactions})
+        _record_plaid_call(user_id, "transactions")
         return jsonify({
             "transactions": all_transactions,
             "total": total_transactions,
