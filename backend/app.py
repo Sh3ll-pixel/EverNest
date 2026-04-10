@@ -40,13 +40,24 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
 if not app.config["SECRET_KEY"]:
     raise RuntimeError("SECRET_KEY environment variable is required. Set it in Render dashboard.")
 
-# Fix stale/dropped connections (SSL error: decryption failed or bad record mac)
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+# Fix stale/dropped connections (Render drops idle SSL connections)
+_engine_opts = {
     "pool_pre_ping": True,        # Test connections before using them
-    "pool_recycle": 300,           # Recycle connections every 5 minutes
-    "pool_size": 5,
-    "max_overflow": 10,
+    "pool_recycle": 120,           # Recycle connections every 2 minutes
+    "pool_size": 3,
+    "max_overflow": 5,
+    "pool_timeout": 10,
 }
+if "postgresql" in database_url:
+    _engine_opts["connect_args"] = {
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+        "connect_timeout": 10,
+        "sslmode": "require",
+    }
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = _engine_opts
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
@@ -1682,7 +1693,7 @@ def _set_cache(key, data):
 # ── Core routes ─────────────────────────────────────────────────────────────
 
 # Current app version — bump this when you push a new release
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.0"
 
 @app.route("/")
 def home():
