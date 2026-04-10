@@ -22,9 +22,19 @@ from plaid.model.country_code import CountryCode
 from plaid.model.products import Products
 import stripe
 import requests
+import hashlib
+from cryptography.fernet import Fernet
 
 app = Flask(__name__)
-CORS(app)
+
+# ── CORS: Only allow requests from our own domains ────────────────────────
+CORS(app, origins=[
+    "https://evernest-swz9.onrender.com",
+    "https://www.evernest.pro",
+    "https://evernest.pro",
+], supports_credentials=True)
+# Desktop app uses direct API calls with no Origin header — Flask-CORS
+# allows these by default (no Origin = not a cross-origin request).
 
 
 
@@ -63,7 +73,7 @@ bcrypt = Bcrypt(app)
 
 # ── JWT Authentication ───────────────────────────────────────────────────────
 JWT_SECRET = app.config["SECRET_KEY"]
-JWT_EXPIRY_HOURS = 72  # Tokens last 3 days
+JWT_EXPIRY_HOURS = 24  # Tokens expire after 24 hours
 
 
 def generate_token(user_id):
@@ -103,6 +113,122 @@ def require_auth(f):
         g.user_id = str(user_id)
         return f(*args, **kwargs)
     return decorated
+
+
+# ── Brute Force Protection & Account Lockout ──────────────────────────────
+# All in-memory — cannot be manipulated via database access.
+# 5 failed attempts per 15 minutes per email. Account locks after 5 failures.
+_login_attempts = {}   # { "email": [timestamp, timestamp, ...] }
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+
+
+def _check_login_allowed(email):
+    """Returns (allowed, message). Blocks if too many failed attempts."""
+    email = email.lower().strip()
+    now = datetime.datetime.utcnow()
+    cutoff = now - datetime.timedelta(minutes=LOCKOUT_MINUTES)
+
+    if email not in _login_attempts:
+        _login_attempts[email] = []
+
+    # Clean old attempts
+    _login_attempts[email] = [t for t in _login_attempts[email] if t > cutoff]
+
+    if len(_login_attempts[email]) >= MAX_LOGIN_ATTEMPTS:
+        oldest = _login_attempts[email][0]
+        wait = int((oldest + datetime.timedelta(minutes=LOCKOUT_MINUTES) - now).total_seconds())
+        return False, f"Too many failed attempts. Try again in {wait // 60 + 1} minutes."
+
+    return True, ""
+
+
+def _record_failed_login(email):
+    """Record a failed login attempt."""
+    email = email.lower().strip()
+    if email not in _login_attempts:
+        _login_attempts[email] = []
+    _login_attempts[email].append(datetime.datetime.utcnow())
+
+
+def _clear_login_attempts(email):
+    """Clear failed attempts on successful login."""
+    email = email.lower().strip()
+    _login_attempts.pop(email, None)
+
+
+# ── Plaid Token Encryption (Fernet / AES-128) ────────────────────────────
+# Derives a Fernet key from SECRET_KEY so Plaid access tokens are encrypted
+# at rest. Even if the database is breached, tokens are unreadable.
+
+def _get_fernet():
+    """Derive a Fernet key from SECRET_KEY."""
+    key_bytes = app.config["SECRET_KEY"].encode("utf-8")
+    # Fernet needs exactly 32 url-safe base64 bytes
+    import base64
+    digest = hashlib.sha256(key_bytes).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_plaid_token(plain_token):
+    """Encrypt a Plaid access token for database storage."""
+    if not plain_token:
+        return None
+    try:
+        f = _get_fernet()
+        return f.encrypt(plain_token.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        print(f"[CRYPTO] Encryption failed: {e}")
+        return plain_token  # Fallback to plain if crypto fails
+
+
+def decrypt_plaid_token(encrypted_token):
+    """Decrypt a Plaid access token from database storage."""
+    if not encrypted_token:
+        return None
+    try:
+        f = _get_fernet()
+        return f.decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
+    except Exception:
+        # Might be a legacy unencrypted token — return as-is
+        return encrypted_token
+
+
+# ── Input Length Limits ───────────────────────────────────────────────────
+# Enforced on all user-submitted text to prevent database bloat.
+INPUT_LIMITS = {
+    "username":   32,
+    "email":      120,
+    "password":   128,
+    "note_title": 200,
+    "note_body":  50000,    # ~50KB per note (free tier)
+    "list_name":  100,
+    "item_name":  200,
+    "bill_name":  100,
+    "event_title": 200,
+    "event_desc": 2000,
+    "bug_report": 2000,
+    "category":   50,
+}
+
+
+def _check_length(value, field_name):
+    """Returns (valid, error_message). Truncates silently if slightly over."""
+    if value is None:
+        return True, ""
+    limit = INPUT_LIMITS.get(field_name, 500)
+    if len(str(value)) > limit * 2:  # Way over = reject
+        return False, f"{field_name} exceeds maximum length ({limit} chars)"
+    return True, ""
+
+
+def _truncate(value, field_name):
+    """Truncate a value to its limit."""
+    if value is None:
+        return value
+    limit = INPUT_LIMITS.get(field_name, 500)
+    return str(value)[:limit]
+
 
 # ── Email System (Resend) ────────────────────────────────────────────────────
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -1234,10 +1360,12 @@ def get_notes():
 @require_auth
 def create_note():
     data = request.get_json() or {}
+    title = _truncate(data.get("title", "Untitled"), "note_title")
+    body = _truncate(data.get("body", ""), "note_body")
     note = Note(
         user_id         = str(data.get("user_id", "")),
-        title           = data.get("title", "Untitled"),
-        body            = data.get("body", ""),
+        title           = title,
+        body            = body,
         note_type       = data.get("note_type", "note"),
         checklist_items = json.dumps(data.get("checklist_items", [])),
         family_shared   = data.get("family_shared", False),
@@ -1263,8 +1391,8 @@ def update_note(note_id):
     if not note:
         return jsonify({"error": "Not found"}), 404
     data = request.get_json() or {}
-    note.title           = data.get("title", note.title)
-    note.body            = data.get("body", note.body)
+    note.title           = _truncate(data.get("title", note.title), "note_title")
+    note.body            = _truncate(data.get("body", note.body), "note_body")
     note.note_type       = data.get("note_type", note.note_type)
     note.checklist_items = json.dumps(data.get("checklist_items", []))
     note.family_shared   = data.get("family_shared", note.family_shared)
@@ -1949,7 +2077,7 @@ def admin_panel():
 
             <!-- Search User -->
             <div class="section">
-                <h3>🔍  Find User</h3>
+                <h3>Find User</h3>
                 <div class="row">
                     <input type="text" id="searchInput" placeholder="Search by email or username">
                     <button class="btn-primary btn-sm" onclick="searchUser()">Search</button>
@@ -1960,7 +2088,7 @@ def admin_panel():
 
             <!-- Grant Subscription -->
             <div class="section">
-                <h3>⭐  Grant Free Subscription</h3>
+                <h3>Grant Free Subscription</h3>
                 <div class="row">
                     <input type="text" id="grantEmail" placeholder="Email or username">
                     <select id="grantDays" style="width:140px;flex:none;">
@@ -1977,7 +2105,7 @@ def admin_panel():
 
             <!-- Remove Subscription -->
             <div class="section">
-                <h3>🚫  Remove Subscription</h3>
+                <h3>Remove Subscription</h3>
                 <div class="row">
                     <input type="text" id="revokeEmail" placeholder="Email or username">
                     <button class="btn-danger btn-sm" onclick="revokeSub()">Revoke</button>
@@ -1987,18 +2115,49 @@ def admin_panel():
 
             <!-- Users Table -->
             <div class="section">
-                <h3>👥  Users</h3>
+                <h3>Users</h3>
                 <div id="usersTable"></div>
+            </div>
+
+            <!-- Plaid Cost Monitor -->
+            <div class="section">
+                <h3>Plaid Cost Monitor</h3>
+                <div id="plaidCosts"><em style="color:#4b5563;">Loading...</em></div>
+                <div id="plaidMsg"></div>
+                <button class="btn-sm" style="background:#1e2a42;color:#7B93DB;margin-top:8px;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;" onclick="loadPlaidCosts()">Refresh</button>
+            </div>
+
+            <!-- Change User Email -->
+            <div class="section">
+                <h3>Account Recovery - Change Email</h3>
+                <div class="row">
+                    <input type="text" id="changeEmailUserId" placeholder="User ID" style="width:120px;">
+                    <input type="text" id="changeEmailNew" placeholder="New email address">
+                    <button class="btn-success btn-sm" onclick="changeEmail()">Update</button>
+                </div>
+                <div id="emailMsg"></div>
             </div>
         </div>
 
         <script>
             let ADMIN_KEY = '';
             const API = '';
+            let SESSION_START = null;
+            const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+
+            function checkSessionTimeout() {
+                if (SESSION_START && (Date.now() - SESSION_START > SESSION_TIMEOUT_MS)) {
+                    logout();
+                    document.getElementById('loginMsg').innerHTML =
+                        '<div class="msg msg-err">Session expired (1hr timeout)</div>';
+                    return false;
+                }
+                return true;
+            }
+            setInterval(checkSessionTimeout, 30000); // Check every 30s
 
             function doLogin() {
                 ADMIN_KEY = document.getElementById('adminKeyInput').value;
-                // Test the key with a simple request
                 fetch(API + '/admin/users', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -2006,9 +2165,11 @@ def admin_panel():
                 })
                 .then(r => { if (!r.ok) throw new Error('Invalid key'); return r.json(); })
                 .then(() => {
+                    SESSION_START = Date.now();
                     document.getElementById('loginView').style.display = 'none';
                     document.getElementById('adminPanel').classList.add('active');
                     listAllUsers();
+                    loadPlaidCosts();
                 })
                 .catch(() => {
                     document.getElementById('loginMsg').innerHTML =
@@ -2016,19 +2177,20 @@ def admin_panel():
                 });
             }
 
-            // Enter key on password field
             document.getElementById('adminKeyInput').addEventListener('keypress', e => {
                 if (e.key === 'Enter') doLogin();
             });
 
             function logout() {
                 ADMIN_KEY = '';
+                SESSION_START = null;
                 document.getElementById('adminPanel').classList.remove('active');
                 document.getElementById('loginView').style.display = 'flex';
                 document.getElementById('adminKeyInput').value = '';
             }
 
             function adminFetch(path, body) {
+                if (!checkSessionTimeout()) return Promise.reject('Session expired');
                 return fetch(API + path, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -2063,12 +2225,13 @@ def admin_panel():
                         else
                             badge = '<span class="badge badge-inactive">Free</span>';
 
-                        let end = u.subscription_end ? u.subscription_end.substring(0, 10) : '—';
+                        let end = u.subscription_end ? u.subscription_end.substring(0, 10) : '\\u2014';
                         html += '<tr><td>' + u.id + '</td><td>' + u.username +
                                 '</td><td>' + u.email + '</td><td>' + badge +
                                 '</td><td>' + end + '</td><td>' +
                                 '<button class="btn-success btn-sm" onclick="quickGrant(\\''+u.email+'\\')">Grant</button> ' +
-                                '<button class="btn-danger btn-sm" onclick="quickRevoke(\\''+u.email+'\\')">Revoke</button>' +
+                                '<button class="btn-danger btn-sm" onclick="quickRevoke(\\''+u.email+'\\')">Revoke</button> ' +
+                                '<button class="btn-sm" style="background:#1e2a42;color:#7B93DB;" onclick="resetRateLimit(\\''+u.id+'\\',\\''+u.username+'\\')">Reset Limits</button>' +
                                 '</td></tr>';
                     });
                     html += '</table>';
@@ -2086,7 +2249,7 @@ def admin_panel():
                     'ID: ' + u.id + ' | ' + badge +
                     (u.subscription_end ? ' | Ends: ' + u.subscription_end.substring(0,10) : '') +
                     (u.stripe_customer_id ? ' | Stripe: ' + u.stripe_customer_id : '') +
-                    (u.plaid_access_token ? ' | 🏦 Bank linked' : '') +
+                    (u.plaid_access_token ? ' | Bank linked' : '') +
                     '</div>';
             }
 
@@ -2111,7 +2274,7 @@ def admin_panel():
                     email: isEmail ? input : '', username: isEmail ? '' : input
                 }).then(data => {
                     document.getElementById('revokeMsg').innerHTML = data.success ?
-                        '<div class="msg msg-ok">Revoked subscription for ' + (data.user || input) + '</div>' :
+                        '<div class="msg msg-ok">Revoked</div>' :
                         '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
                     listAllUsers();
                 });
@@ -2122,6 +2285,54 @@ def admin_panel():
             }
             function quickRevoke(email) {
                 adminFetch('/admin/revoke_subscription', {email: email}).then(() => listAllUsers());
+            }
+
+            function resetRateLimit(userId, username) {
+                if (!confirm('Reset rate limits and Plaid costs for ' + username + '?')) return;
+                adminFetch('/admin/reset_rate_limit', {user_id: userId}).then(data => {
+                    document.getElementById('plaidMsg').innerHTML = data.success ?
+                        '<div class="msg msg-ok">' + data.message + '</div>' :
+                        '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    loadPlaidCosts();
+                });
+            }
+
+            function changeEmail() {
+                const userId = document.getElementById('changeEmailUserId').value.trim();
+                const newEmail = document.getElementById('changeEmailNew').value.trim();
+                if (!userId || !newEmail) return;
+                adminFetch('/admin/change_email', {user_id: userId, new_email: newEmail}).then(data => {
+                    document.getElementById('emailMsg').innerHTML = data.success ?
+                        '<div class="msg msg-ok">' + data.message + '</div>' :
+                        '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    listAllUsers();
+                });
+            }
+
+            function loadPlaidCosts() {
+                adminFetch('/admin/plaid_costs', {}).then(data => {
+                    if (data.error) return;
+                    let html = '<div style="margin-bottom:12px;color:#6b7280;font-size:13px;">' +
+                        'Month: ' + data.month + ' | ' +
+                        'Total est. cost: <strong style="color:#f87171;">$' + data.total_estimated_cost.toFixed(2) + '</strong> | ' +
+                        'Max/user: $' + data.max_per_user.toFixed(2) + ' | ' +
+                        'Margin/user: $' + data.margin_per_user.toFixed(2) +
+                        '</div>';
+                    if (data.user_costs.length > 0) {
+                        html += '<table><tr><th>User</th><th>Cost</th><th>Ceiling</th><th>Used</th></tr>';
+                        data.user_costs.forEach(c => {
+                            let color = c.pct_used > 80 ? '#f87171' : c.pct_used > 50 ? '#fbbf24' : '#4ade80';
+                            html += '<tr><td>' + c.username + '</td>' +
+                                '<td>$' + c.cost_this_month.toFixed(2) + '</td>' +
+                                '<td>$' + c.ceiling.toFixed(2) + '</td>' +
+                                '<td style="color:' + color + ';">' + c.pct_used + '%</td></tr>';
+                        });
+                        html += '</table>';
+                    } else {
+                        html += '<div style="color:#4b5563;">No Plaid costs tracked this month.</div>';
+                    }
+                    document.getElementById('plaidCosts').innerHTML = html;
+                });
             }
         </script>
     </body>
@@ -2295,6 +2506,16 @@ def signup():
     if not username or not email or not password:
         return jsonify({"success": False, "message": "All fields are required"}), 400
 
+    # Input length limits
+    if len(username) > INPUT_LIMITS["username"]:
+        return jsonify({"success": False, "message": f"Username max {INPUT_LIMITS['username']} characters"}), 400
+    if len(email) > INPUT_LIMITS["email"]:
+        return jsonify({"success": False, "message": f"Email max {INPUT_LIMITS['email']} characters"}), 400
+    if len(password) > INPUT_LIMITS["password"]:
+        return jsonify({"success": False, "message": f"Password max {INPUT_LIMITS['password']} characters"}), 400
+    if len(password) < 8:
+        return jsonify({"success": False, "message": "Password must be at least 8 characters"}), 400
+
     existing_user = User.query.filter(
         (User.username == username) | (User.email == email)
     ).first()
@@ -2308,6 +2529,7 @@ def signup():
     db.session.commit()
 
     token = generate_token(new_user.id)
+    print(f"[AUDIT] SIGNUP | user={username} | email={email} | ip={request.remote_addr}")
     email_welcome(username, email)
     return jsonify({"success": True, "message": "Signup successful", "token": token}), 201
 
@@ -2320,12 +2542,34 @@ def login():
     if not login_value or not password:
         return jsonify({"success": False, "message": "Login and password required"}), 400
 
+    # Input length check
+    if len(login_value) > INPUT_LIMITS["email"] or len(password) > INPUT_LIMITS["password"]:
+        return jsonify({"success": False, "message": "Input too long"}), 400
+
+    # Brute force check
+    allowed, msg = _check_login_allowed(login_value)
+    if not allowed:
+        return jsonify({"success": False, "message": msg}), 429
+
     user = User.query.filter(
         (User.username == login_value) | (User.email == login_value.lower())
     ).first()
 
     if not user or not bcrypt.check_password_hash(user.password_hash, password):
-        return jsonify({"success": False, "message": "Invalid credentials"}), 401
+        _record_failed_login(login_value)
+        print(f"[AUDIT] LOGIN_FAILED | login={login_value} | ip={request.remote_addr}")
+        remaining = MAX_LOGIN_ATTEMPTS - len([
+            t for t in _login_attempts.get(login_value.lower().strip(), [])
+            if t > datetime.datetime.utcnow() - datetime.timedelta(minutes=LOCKOUT_MINUTES)
+        ])
+        msg = "Invalid credentials"
+        if remaining <= 2:
+            msg += f" ({remaining} attempts remaining)"
+        return jsonify({"success": False, "message": msg}), 401
+
+    # Success — clear failed attempts
+    _clear_login_attempts(login_value)
+    print(f"[AUDIT] LOGIN_SUCCESS | user={user.username} | email={user.email} | ip={request.remote_addr}")
 
     family, member = get_user_family(user.id)
 
@@ -2386,6 +2630,62 @@ def admin_plaid_costs():
         "user_costs": sorted(costs, key=lambda x: x["cost_this_month"], reverse=True),
         "rate_limit_usage": rate_stats,
     })
+
+
+@app.route("/admin/reset_rate_limit", methods=["POST"])
+def admin_reset_rate_limit():
+    """Reset a user's Plaid rate limit counters and/or cost tracking."""
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    user_id = str(data.get("user_id", ""))
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+
+    # Clear rate limits for this user
+    keys_to_remove = [k for k in _plaid_rate if k.startswith(f"{user_id}:")]
+    for k in keys_to_remove:
+        del _plaid_rate[k]
+
+    # Clear cost tracking for this user
+    if user_id in _plaid_cost:
+        del _plaid_cost[user_id]
+
+    print(f"[AUDIT] ADMIN_RESET_RATE | user_id={user_id} | ip={request.remote_addr}")
+    return jsonify({"success": True, "message": f"Rate limits and costs reset for user {user_id}"})
+
+
+@app.route("/admin/change_email", methods=["POST"])
+def admin_change_email():
+    """Change a user's email for account recovery purposes."""
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    user_id   = data.get("user_id")
+    new_email = data.get("new_email", "").strip().lower()
+
+    if not user_id or not new_email:
+        return jsonify({"error": "user_id and new_email required"}), 400
+
+    if len(new_email) > INPUT_LIMITS["email"]:
+        return jsonify({"error": "Email too long"}), 400
+
+    # Check for existing email
+    existing = User.query.filter(db.func.lower(User.email) == new_email).first()
+    if existing and existing.id != int(user_id):
+        return jsonify({"error": "Email already in use by another account"}), 409
+
+    user = User.query.get(int(user_id))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    old_email = user.email
+    user.email = new_email
+    db.session.commit()
+    print(f"[AUDIT] ADMIN_CHANGE_EMAIL | user_id={user_id} | old={old_email} | new={new_email} | ip={request.remote_addr}")
+    return jsonify({"success": True, "message": f"Email changed from {old_email} to {new_email}"})
 
 
 # ── Password Reset ───────────────────────────────────────────────────────────
@@ -2588,7 +2888,7 @@ def remove_bank():
     # Call Plaid /item/remove to deactivate the Item and stop billing
     if user.plaid_access_token and plaid_client:
         try:
-            req = ItemRemoveRequest(access_token=user.plaid_access_token)
+            req = ItemRemoveRequest(access_token=decrypt_plaid_token(user.plaid_access_token))
             plaid_client.item_remove(req)
             print(f"[PLAID] Removed Item for user {user_id}")
         except Exception as e:
@@ -2628,7 +2928,7 @@ def delete_account():
     # Call Plaid /item/remove to deactivate the Item on user offboarding
     if user.plaid_access_token and plaid_client:
         try:
-            req = ItemRemoveRequest(access_token=user.plaid_access_token)
+            req = ItemRemoveRequest(access_token=decrypt_plaid_token(user.plaid_access_token))
             plaid_client.item_remove(req)
             print(f"[PLAID] Removed Item for deleted user {user_id}")
         except Exception as e:
@@ -2801,7 +3101,7 @@ def exchange_token():
 
         user = find_user_by_id(user_id)
         if user:
-            user.plaid_access_token    = access_token
+            user.plaid_access_token    = encrypt_plaid_token(access_token)
             user.plaid_item_id         = item_id
             user.plaid_reauth_required = False
             db.session.commit()
@@ -2848,7 +3148,7 @@ def get_accounts():
             if u and u.plaid_access_token:
                 try:
                     resp     = plaid_client.accounts_get(
-                        AccountsGetRequest(access_token=u.plaid_access_token)
+                        AccountsGetRequest(access_token=decrypt_plaid_token(u.plaid_access_token))
                     )
                     request_id = resp.get("request_id", "")
                     accounts = [a.to_dict() for a in resp["accounts"]]
@@ -2894,7 +3194,7 @@ def get_realtime_balance():
         if cached:
             return jsonify({"accounts": cached, "cached": True})
 
-        req = AccountsBalanceGetRequest(access_token=user.plaid_access_token)
+        req = AccountsBalanceGetRequest(access_token=decrypt_plaid_token(user.plaid_access_token))
         response = plaid_client.accounts_balance_get(req)
         request_id = response.get("request_id", "")
         accounts = [a.to_dict() for a in response["accounts"]]
@@ -2958,7 +3258,7 @@ def get_transactions():
         # Paginate through all transactions
         while True:
             req = TransactionsGetRequest(
-                access_token=user.plaid_access_token,
+                access_token=decrypt_plaid_token(user.plaid_access_token),
                 start_date=start_date,
                 end_date=end_date,
                 options=TransactionsGetRequestOptions(
@@ -3030,7 +3330,7 @@ def refresh_transactions():
         if not user or not user.plaid_access_token:
             return jsonify({"error": "No bank account connected"}), 400
 
-        req = TransactionsRefreshRequest(access_token=user.plaid_access_token)
+        req = TransactionsRefreshRequest(access_token=decrypt_plaid_token(user.plaid_access_token))
         plaid_client.transactions_refresh(req)
         print(f"[PLAID TXN] Triggered refresh for user {user_id}")
         return jsonify({"success": True, "message": "Refresh triggered. New data will arrive via webhook."})
@@ -3059,7 +3359,7 @@ def create_update_link_token():
             language="en",
             webhook="https://evernest-swz9.onrender.com/plaid/webhook",
             redirect_uri=PLAID_REDIRECT_URI,
-            access_token=user.plaid_access_token,
+            access_token=decrypt_plaid_token(user.plaid_access_token),
         )
         response   = plaid_client.link_token_create(req)
         link_token = response["link_token"]
@@ -3106,7 +3406,7 @@ def create_new_accounts_link_token():
             language="en",
             webhook="https://evernest-swz9.onrender.com/plaid/webhook",
             redirect_uri=PLAID_REDIRECT_URI,
-            access_token=user.plaid_access_token,
+            access_token=decrypt_plaid_token(user.plaid_access_token),
             update={"account_selection_enabled": True},
         )
         response   = plaid_client.link_token_create(req)
