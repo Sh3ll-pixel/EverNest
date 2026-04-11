@@ -27,20 +27,15 @@ from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
-# ── CORS: Only allow requests from our own domains ────────────────────────
 CORS(app, origins=[
     "https://evernest-swz9.onrender.com",
     "https://www.evernest.pro",
     "https://evernest.pro",
 ], supports_credentials=True)
-# Desktop app uses direct API calls with no Origin header — Flask-CORS
-# allows these by default (no Origin = not a cross-origin request).
 
 
 
-# ── App config ─────────────────────────────────────────────────────────────
 database_url = os.environ.get("DATABASE_URL", "sqlite:///users.db")
-# Render uses postgres:// but SQLAlchemy needs postgresql://
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -50,10 +45,9 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
 if not app.config["SECRET_KEY"]:
     raise RuntimeError("SECRET_KEY environment variable is required. Set it in Render dashboard.")
 
-# Fix stale/dropped connections (Render drops idle SSL connections)
 _engine_opts = {
-    "pool_pre_ping": True,        # Test connections before using them
-    "pool_recycle": 120,           # Recycle connections every 2 minutes
+    "pool_pre_ping": True,        
+    "pool_recycle": 120,           
     "pool_size": 3,
     "max_overflow": 5,
     "pool_timeout": 10,
@@ -71,9 +65,8 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = _engine_opts
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 
-# ── JWT Authentication ───────────────────────────────────────────────────────
 JWT_SECRET = app.config["SECRET_KEY"]
-JWT_EXPIRY_HOURS = 24  # Tokens expire after 24 hours
+JWT_EXPIRY_HOURS = 24  
 
 
 def generate_token(user_id):
@@ -116,9 +109,7 @@ def require_auth(f):
 
 
 # ── Brute Force Protection & Account Lockout ──────────────────────────────
-# All in-memory — cannot be manipulated via database access.
-# 5 failed attempts per 15 minutes per email. Account locks after 5 failures.
-_login_attempts = {}   # { "email": [timestamp, timestamp, ...] }
+_login_attempts = {}   
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 
@@ -132,7 +123,7 @@ def _check_login_allowed(email):
     if email not in _login_attempts:
         _login_attempts[email] = []
 
-    # Clean old attempts
+    
     _login_attempts[email] = [t for t in _login_attempts[email] if t > cutoff]
 
     if len(_login_attempts[email]) >= MAX_LOGIN_ATTEMPTS:
@@ -158,13 +149,9 @@ def _clear_login_attempts(email):
 
 
 # ── Plaid Token Encryption (Fernet / AES-128) ────────────────────────────
-# Derives a Fernet key from SECRET_KEY so Plaid access tokens are encrypted
-# at rest. Even if the database is breached, tokens are unreadable.
-
 def _get_fernet():
     """Derive a Fernet key from SECRET_KEY."""
     key_bytes = app.config["SECRET_KEY"].encode("utf-8")
-    # Fernet needs exactly 32 url-safe base64 bytes
     import base64
     digest = hashlib.sha256(key_bytes).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
@@ -179,7 +166,7 @@ def encrypt_plaid_token(plain_token):
         return f.encrypt(plain_token.encode("utf-8")).decode("utf-8")
     except Exception as e:
         print(f"[CRYPTO] Encryption failed: {e}")
-        return plain_token  # Fallback to plain if crypto fails
+        return plain_token
 
 
 def decrypt_plaid_token(encrypted_token):
@@ -195,13 +182,12 @@ def decrypt_plaid_token(encrypted_token):
 
 
 # ── Input Length Limits ───────────────────────────────────────────────────
-# Enforced on all user-submitted text to prevent database bloat.
 INPUT_LIMITS = {
     "username":   32,
     "email":      120,
     "password":   128,
     "note_title": 200,
-    "note_body":  50000,    # ~50KB per note (free tier)
+    "note_body":  50000,    # ~50KB per note (free tier) update as needed, maybe introduce an unlimited tier at some point???
     "list_name":  100,
     "item_name":  200,
     "bill_name":  100,
@@ -217,7 +203,7 @@ def _check_length(value, field_name):
     if value is None:
         return True, ""
     limit = INPUT_LIMITS.get(field_name, 500)
-    if len(str(value)) > limit * 2:  # Way over = reject
+    if len(str(value)) > limit * 2:  
         return False, f"{field_name} exceeds maximum length ({limit} chars)"
     return True, ""
 
@@ -287,6 +273,7 @@ def _email_wrap(title, body_html):
       </p>
     </div>
     """
+    # dont forget to configure resend before going live, or else youre retarded!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 def email_welcome(username, email):
@@ -479,7 +466,6 @@ def find_user_by_id(user_id):
     user_id = str(user_id).strip()
     if not user_id:
         return None
-    # Try integer ID first
     try:
         uid_int = int(user_id)
         user = User.query.filter(User.id == uid_int).first()
@@ -487,7 +473,6 @@ def find_user_by_id(user_id):
             return user
     except (ValueError, TypeError):
         pass
-    # Fall back to username match
     return User.query.filter(User.username == user_id).first()
 
 
@@ -500,7 +485,7 @@ STRIPE_PRICE_ID       = os.getenv("STRIPE_PRICE_ID")
 PAYPAL_CLIENT_ID     = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 PAYPAL_PLAN_ID       = os.getenv("PAYPAL_PLAN_ID")
-PAYPAL_API_BASE      = os.getenv("PAYPAL_API_BASE", "https://api-m.paypal.com")  # Live by default
+PAYPAL_API_BASE      = os.getenv("PAYPAL_API_BASE", "https://api-m.paypal.com") 
  
 def get_paypal_access_token():
     import base64
@@ -532,13 +517,12 @@ def subscription_status():
     cancel_at_period_end = False
     shared_from = None
 
-    # Check if subscription_end has passed
+    
     if user.is_subscribed and user.subscription_end:
         if datetime.datetime.utcnow() > user.subscription_end:
             user.is_subscribed = False
             db.session.commit()
 
-    # Check Stripe for current state
     if user.stripe_customer_id:
         try:
             subs = stripe.Subscription.list(
@@ -556,11 +540,10 @@ def subscription_status():
                 cancel_at_period_end = bool(valid_sub.cancel_at_period_end)
                 db.session.commit()
             elif not user.is_subscribed:
-                pass  # Already not subscribed
+                pass
         except Exception as e:
             print(f"[SUB STATUS] Stripe check failed: {e}")
 
-    # If user is not subscribed, check if a family member is
     if not user.is_subscribed:
         try:
             family, _ = get_user_family(user.id)
@@ -571,7 +554,6 @@ def subscription_status():
                         continue
                     member = User.query.get(mid)
                     if member and member.is_subscribed:
-                        # Family member has active subscription — grant access
                         shared_from = member.username
                         user.is_subscribed = True
                         user.subscription_end = member.subscription_end
@@ -640,7 +622,6 @@ def stripe_create_session():
         if not user:
             return jsonify({"error": "User not found"}), 404
  
-        # Create or reuse Stripe customer
         if user.stripe_customer_id:
             customer_id = user.stripe_customer_id
         else:
@@ -2020,7 +2001,7 @@ def _get_allowed_user_ids(user_id):
 # ── Core routes ─────────────────────────────────────────────────────────────
 
 # Current app version — bump this when you push a new release
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
 @app.route("/")
 def home():
