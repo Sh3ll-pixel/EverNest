@@ -455,6 +455,22 @@ class User(db.Model):
     verification_token     = db.Column(db.String(100), nullable=True)
 
 
+class Suggestion(db.Model):
+    id          = db.Column(db.Integer, primary_key=True)
+    user_id     = db.Column(db.Integer, nullable=False)
+    title       = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, default="")
+    status      = db.Column(db.String(30), default="open")  # open, planned, done, declined
+    created_at  = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+
+class SuggestionVote(db.Model):
+    id            = db.Column(db.Integer, primary_key=True)
+    suggestion_id = db.Column(db.Integer, db.ForeignKey("suggestion.id"), nullable=False)
+    user_id       = db.Column(db.Integer, nullable=False)
+    vote          = db.Column(db.Integer, default=1)  # 1 = upvote, -1 = downvote
+
+
 def find_user_by_id(user_id):
     """Safely look up a user by integer ID or username string.
     Handles PostgreSQL type strictness (can't compare int column to string)."""
@@ -2824,6 +2840,477 @@ def admin_change_email():
     return jsonify({"success": True, "message": f"Email changed from {old_email} to {new_email}"})
 
 
+# ── Suggestions Board ─────────────────────────────────────────────────────────
+
+@app.route("/suggestions", methods=["GET"])
+def get_suggestions():
+    """Get all suggestions with vote counts. No auth required for viewing."""
+    sort = request.args.get("sort", "votes")  # votes, newest, oldest
+    user_id = request.args.get("user_id")  # optional — to show user's own votes
+
+    suggestions = Suggestion.query.all()
+    result = []
+    for s in suggestions:
+        votes = SuggestionVote.query.filter_by(suggestion_id=s.id).all()
+        score = sum(v.vote for v in votes)
+        upvotes = sum(1 for v in votes if v.vote == 1)
+        downvotes = sum(1 for v in votes if v.vote == -1)
+
+        # Check if requesting user has voted
+        my_vote = 0
+        if user_id:
+            existing = SuggestionVote.query.filter_by(
+                suggestion_id=s.id, user_id=int(user_id)
+            ).first()
+            if existing:
+                my_vote = existing.vote
+
+        creator = User.query.get(s.user_id)
+        result.append({
+            "id": s.id,
+            "title": s.title,
+            "description": s.description,
+            "status": s.status,
+            "score": score,
+            "upvotes": upvotes,
+            "downvotes": downvotes,
+            "my_vote": my_vote,
+            "created_by": creator.username if creator else "Unknown",
+            "created_at": s.created_at.isoformat() if s.created_at else "",
+        })
+
+    if sort == "votes":
+        result.sort(key=lambda x: x["score"], reverse=True)
+    elif sort == "newest":
+        result.sort(key=lambda x: x["created_at"], reverse=True)
+    elif sort == "oldest":
+        result.sort(key=lambda x: x["created_at"])
+
+    return jsonify({"suggestions": result})
+
+
+@app.route("/suggestions", methods=["POST"])
+@require_auth
+def create_suggestion():
+    data = request.get_json() or {}
+    user_id = data.get("user_id")
+    title = data.get("title", "").strip()
+    description = data.get("description", "").strip()
+
+    if not title:
+        return jsonify({"error": "Title is required"}), 400
+    if len(title) > 200:
+        return jsonify({"error": "Title max 200 characters"}), 400
+    if len(description) > 2000:
+        return jsonify({"error": "Description max 2000 characters"}), 400
+
+    # Limit to 3 suggestions per user per day
+    today_start = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0)
+    today_count = Suggestion.query.filter(
+        Suggestion.user_id == int(user_id),
+        Suggestion.created_at >= today_start
+    ).count()
+    if today_count >= 3:
+        return jsonify({"error": "Max 3 suggestions per day"}), 429
+
+    s = Suggestion(user_id=int(user_id), title=title, description=description)
+    db.session.add(s)
+    db.session.commit()
+    print(f"[AUDIT] SUGGESTION_CREATED | user_id={user_id} | title={title[:50]}")
+    return jsonify({"success": True, "id": s.id}), 201
+
+
+@app.route("/suggestions/<int:sid>/vote", methods=["POST"])
+@require_auth
+def vote_suggestion(sid):
+    data = request.get_json() or {}
+    user_id = int(data.get("user_id", 0))
+    vote = data.get("vote", 1)  # 1 or -1
+
+    if vote not in (1, -1, 0):
+        return jsonify({"error": "Vote must be 1, -1, or 0"}), 400
+
+    s = Suggestion.query.get(sid)
+    if not s:
+        return jsonify({"error": "Suggestion not found"}), 404
+
+    existing = SuggestionVote.query.filter_by(suggestion_id=sid, user_id=user_id).first()
+
+    if vote == 0:
+        # Remove vote
+        if existing:
+            db.session.delete(existing)
+            db.session.commit()
+        return jsonify({"success": True})
+
+    if existing:
+        existing.vote = vote
+    else:
+        existing = SuggestionVote(suggestion_id=sid, user_id=user_id, vote=vote)
+        db.session.add(existing)
+
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/suggestions/<int:sid>/status", methods=["POST"])
+def update_suggestion_status(sid):
+    """Admin-only: update suggestion status."""
+    data = request.get_json() or {}
+    if not _admin_auth(data):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    status = data.get("status", "open")
+    if status not in ("open", "planned", "done", "declined"):
+        return jsonify({"error": "Invalid status"}), 400
+
+    s = Suggestion.query.get(sid)
+    if not s:
+        return jsonify({"error": "Not found"}), 404
+
+    s.status = status
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+# ── Suggestions Web Page ──────────────────────────────────────────────────────
+
+@app.route("/suggestions/board")
+def suggestions_board():
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>EverNest — Suggestions Board</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: 'DM Sans', sans-serif; background: #0c0e14; color: #e5e7eb;
+                   min-height: 100vh; }
+            a { color: #5b6ef7; text-decoration: none; }
+
+            .topbar { background: #161a1f; border-bottom: 1px solid #2a2f38;
+                      padding: 16px 32px; display: flex; justify-content: space-between;
+                      align-items: center; position: sticky; top: 0; z-index: 100; }
+            .topbar-logo { font-family: 'Syne', sans-serif; font-size: 20px;
+                           font-weight: 800; color: #96abff; }
+            .topbar-right { display: flex; gap: 12px; align-items: center; }
+            .topbar-user { color: #6b7280; font-size: 13px; }
+
+            .container { max-width: 800px; margin: 0 auto; padding: 32px 20px; }
+            h1 { font-family: 'Syne', sans-serif; font-size: 28px; font-weight: 800;
+                 margin-bottom: 4px; }
+            .subtitle { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
+
+            .login-bar { background: #161a1f; border: 1px solid #2a2f38; border-radius: 12px;
+                         padding: 20px; margin-bottom: 24px; }
+            .login-bar input { background: #0c0e14; border: 1px solid #2a2f38; border-radius: 8px;
+                               padding: 10px 14px; color: #e5e7eb; font-size: 14px; width: 200px;
+                               margin-right: 8px; outline: none; }
+            .login-bar input::placeholder { color: #4b5563; }
+
+            .btn { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
+                   font-size: 13px; font-weight: 600; transition: all 0.2s; }
+            .btn-primary { background: #5b6ef7; color: #fff; }
+            .btn-primary:hover { opacity: 0.9; }
+            .btn-outline { background: transparent; color: #6b7280; border: 1px solid #2a2f38; }
+            .btn-outline:hover { border-color: #5b6ef7; color: #5b6ef7; }
+            .btn-sm { padding: 6px 14px; font-size: 12px; }
+            .btn-danger { background: #4a2a2a; color: #f87171; }
+
+            .new-form { background: #161a1f; border: 1px solid #2a2f38; border-radius: 12px;
+                        padding: 20px; margin-bottom: 24px; display: none; }
+            .new-form.active { display: block; }
+            .new-form input, .new-form textarea { width: 100%; background: #0c0e14;
+                border: 1px solid #2a2f38; border-radius: 8px; padding: 10px 14px;
+                color: #e5e7eb; font-size: 14px; margin-bottom: 10px; outline: none;
+                font-family: inherit; }
+            .new-form textarea { height: 80px; resize: vertical; }
+
+            .sort-bar { display: flex; gap: 8px; margin-bottom: 16px; }
+
+            .card { background: #161a1f; border: 1px solid #2a2f38; border-radius: 12px;
+                    padding: 16px; margin-bottom: 12px; display: flex; gap: 16px;
+                    transition: border-color 0.2s; }
+            .card:hover { border-color: #3a3f48; }
+
+            .vote-col { display: flex; flex-direction: column; align-items: center;
+                        min-width: 48px; gap: 2px; }
+            .vote-btn { background: none; border: none; cursor: pointer; font-size: 18px;
+                        padding: 2px 8px; border-radius: 4px; transition: all 0.15s;
+                        color: #4b5563; }
+            .vote-btn:hover { background: #1e2a42; }
+            .vote-btn.active-up { color: #4ade80; }
+            .vote-btn.active-down { color: #f87171; }
+            .vote-score { font-family: 'Syne', sans-serif; font-size: 18px;
+                          font-weight: 700; color: #e5e7eb; }
+            .vote-score.positive { color: #4ade80; }
+            .vote-score.negative { color: #f87171; }
+
+            .card-body { flex: 1; }
+            .card-title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+            .card-desc { color: #6b7280; font-size: 13px; line-height: 1.5; margin-bottom: 8px; }
+            .card-meta { color: #4b5563; font-size: 11px; display: flex; gap: 12px; }
+
+            .badge { padding: 2px 8px; border-radius: 4px; font-size: 10px;
+                     font-weight: 600; text-transform: uppercase; }
+            .badge-open { background: #1e2a42; color: #5b6ef7; }
+            .badge-planned { background: #2a2a1e; color: #fbbf24; }
+            .badge-done { background: #1e2a1e; color: #4ade80; }
+            .badge-declined { background: #2a1e1e; color: #f87171; }
+
+            .msg { padding: 10px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
+            .msg-ok { background: #1a2e1a; color: #4ade80; }
+            .msg-err { background: #2e1a1a; color: #f87171; }
+
+            .empty { text-align: center; padding: 48px; color: #4b5563; }
+
+            @media (max-width: 600px) {
+                .login-bar input { width: 100%; margin-bottom: 8px; }
+                .login-bar { display: flex; flex-direction: column; gap: 8px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="topbar">
+            <a href="https://www.evernest.pro" class="topbar-logo">EverNest</a>
+            <div class="topbar-right">
+                <span class="topbar-user" id="userStatus">Not signed in</span>
+                <button class="btn btn-sm btn-outline" id="authBtn" onclick="toggleAuth()">Sign In</button>
+            </div>
+        </div>
+
+        <div class="container">
+            <h1>Suggestion Board</h1>
+            <p class="subtitle">Vote on features you want, or suggest your own. Sign in with your EverNest account.</p>
+
+            <!-- Login bar -->
+            <div class="login-bar" id="loginBar">
+                <div style="margin-bottom:8px;font-size:13px;color:#6b7280;">Sign in with your EverNest account:</div>
+                <div>
+                    <input type="text" id="loginEmail" placeholder="Email or username">
+                    <input type="password" id="loginPass" placeholder="Password">
+                    <button class="btn btn-primary btn-sm" onclick="doLogin()">Sign In</button>
+                </div>
+                <div id="loginMsg" style="margin-top:8px;"></div>
+            </div>
+
+            <!-- New suggestion form -->
+            <div class="new-form" id="newForm">
+                <div style="font-size:14px;font-weight:600;margin-bottom:10px;">New Suggestion</div>
+                <input type="text" id="newTitle" placeholder="Feature title (e.g. 'Dark mode toggle')" maxlength="200">
+                <textarea id="newDesc" placeholder="Describe the feature... (optional)" maxlength="2000"></textarea>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn btn-primary btn-sm" onclick="submitSuggestion()">Submit</button>
+                    <button class="btn btn-outline btn-sm" onclick="toggleForm()">Cancel</button>
+                </div>
+                <div id="formMsg" style="margin-top:8px;"></div>
+            </div>
+
+            <!-- Controls -->
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <div class="sort-bar">
+                    <button class="btn btn-sm btn-outline" onclick="loadSuggestions('votes')" id="sortVotes">Top Voted</button>
+                    <button class="btn btn-sm btn-outline" onclick="loadSuggestions('newest')" id="sortNew">Newest</button>
+                    <button class="btn btn-sm btn-outline" onclick="loadSuggestions('oldest')" id="sortOld">Oldest</button>
+                </div>
+                <button class="btn btn-primary btn-sm" id="suggestBtn" onclick="toggleForm()" style="display:none;">+ Suggest</button>
+            </div>
+
+            <div id="suggestions"><div class="empty">Loading suggestions...</div></div>
+        </div>
+
+        <script>
+            const API = '';
+            let TOKEN = null;
+            let USER_ID = null;
+            let USERNAME = null;
+            let currentSort = 'votes';
+
+            function doLogin() {
+                const login = document.getElementById('loginEmail').value.trim();
+                const pass = document.getElementById('loginPass').value;
+                if (!login || !pass) return;
+
+                fetch(API + '/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({login: login, password: pass})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        TOKEN = data.token;
+                        USER_ID = data.user.id;
+                        USERNAME = data.user.username;
+                        document.getElementById('loginBar').style.display = 'none';
+                        document.getElementById('userStatus').textContent = USERNAME;
+                        document.getElementById('authBtn').textContent = 'Sign Out';
+                        document.getElementById('suggestBtn').style.display = '';
+                        loadSuggestions(currentSort);
+                    } else {
+                        document.getElementById('loginMsg').innerHTML =
+                            '<div class="msg msg-err">' + (data.message || 'Login failed') + '</div>';
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('loginMsg').innerHTML =
+                        '<div class="msg msg-err">Connection failed</div>';
+                });
+            }
+
+            document.getElementById('loginPass').addEventListener('keypress', e => {
+                if (e.key === 'Enter') doLogin();
+            });
+
+            function toggleAuth() {
+                if (TOKEN) {
+                    TOKEN = null; USER_ID = null; USERNAME = null;
+                    document.getElementById('loginBar').style.display = '';
+                    document.getElementById('userStatus').textContent = 'Not signed in';
+                    document.getElementById('authBtn').textContent = 'Sign In';
+                    document.getElementById('suggestBtn').style.display = 'none';
+                    document.getElementById('newForm').classList.remove('active');
+                    loadSuggestions(currentSort);
+                } else {
+                    document.getElementById('loginBar').style.display =
+                        document.getElementById('loginBar').style.display === 'none' ? '' : 'none';
+                }
+            }
+
+            function toggleForm() {
+                document.getElementById('newForm').classList.toggle('active');
+                document.getElementById('formMsg').innerHTML = '';
+            }
+
+            function submitSuggestion() {
+                if (!TOKEN) return;
+                const title = document.getElementById('newTitle').value.trim();
+                const desc = document.getElementById('newDesc').value.trim();
+                if (!title) {
+                    document.getElementById('formMsg').innerHTML =
+                        '<div class="msg msg-err">Title is required</div>';
+                    return;
+                }
+
+                fetch(API + '/suggestions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN},
+                    body: JSON.stringify({user_id: USER_ID, title: title, description: desc})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('newTitle').value = '';
+                        document.getElementById('newDesc').value = '';
+                        document.getElementById('newForm').classList.remove('active');
+                        loadSuggestions(currentSort);
+                    } else {
+                        document.getElementById('formMsg').innerHTML =
+                            '<div class="msg msg-err">' + (data.error || 'Failed') + '</div>';
+                    }
+                });
+            }
+
+            function vote(sid, v) {
+                if (!TOKEN) {
+                    document.getElementById('loginBar').style.display = '';
+                    return;
+                }
+                fetch(API + '/suggestions/' + sid + '/vote', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN},
+                    body: JSON.stringify({user_id: USER_ID, vote: v})
+                })
+                .then(r => r.json())
+                .then(() => loadSuggestions(currentSort));
+            }
+
+            function loadSuggestions(sort) {
+                currentSort = sort || 'votes';
+                // Highlight active sort button
+                ['sortVotes','sortNew','sortOld'].forEach(id => {
+                    document.getElementById(id).style.borderColor = '#2a2f38';
+                    document.getElementById(id).style.color = '#6b7280';
+                });
+                let activeId = sort === 'votes' ? 'sortVotes' : sort === 'newest' ? 'sortNew' : 'sortOld';
+                document.getElementById(activeId).style.borderColor = '#5b6ef7';
+                document.getElementById(activeId).style.color = '#5b6ef7';
+
+                let url = API + '/suggestions?sort=' + currentSort;
+                if (USER_ID) url += '&user_id=' + USER_ID;
+
+                fetch(url).then(r => r.json()).then(data => {
+                    const list = data.suggestions || [];
+                    if (list.length === 0) {
+                        document.getElementById('suggestions').innerHTML =
+                            '<div class="empty">No suggestions yet. Be the first!</div>';
+                        return;
+                    }
+
+                    let html = '';
+                    list.forEach(s => {
+                        let scoreClass = s.score > 0 ? 'positive' : s.score < 0 ? 'negative' : '';
+                        let upClass = s.my_vote === 1 ? 'active-up' : '';
+                        let downClass = s.my_vote === -1 ? 'active-down' : '';
+
+                        // Toggle: clicking same vote again removes it
+                        let upVote = s.my_vote === 1 ? 0 : 1;
+                        let downVote = s.my_vote === -1 ? 0 : -1;
+
+                        let badgeClass = 'badge-' + s.status;
+                        let statusBadge = s.status !== 'open' ?
+                            '<span class="badge ' + badgeClass + '">' + s.status + '</span>' : '';
+
+                        html += '<div class="card">' +
+                            '<div class="vote-col">' +
+                                '<button class="vote-btn ' + upClass + '" onclick="vote(' + s.id + ',' + upVote + ')">&#9650;</button>' +
+                                '<div class="vote-score ' + scoreClass + '">' + s.score + '</div>' +
+                                '<button class="vote-btn ' + downClass + '" onclick="vote(' + s.id + ',' + downVote + ')">&#9660;</button>' +
+                            '</div>' +
+                            '<div class="card-body">' +
+                                '<div class="card-title">' + escHtml(s.title) + ' ' + statusBadge + '</div>' +
+                                (s.description ? '<div class="card-desc">' + escHtml(s.description) + '</div>' : '') +
+                                '<div class="card-meta">' +
+                                    '<span>by ' + escHtml(s.created_by) + '</span>' +
+                                    '<span>' + timeAgo(s.created_at) + '</span>' +
+                                    '<span>' + s.upvotes + ' up / ' + s.downvotes + ' down</span>' +
+                                '</div>' +
+                            '</div>' +
+                        '</div>';
+                    });
+                    document.getElementById('suggestions').innerHTML = html;
+                });
+            }
+
+            function escHtml(s) {
+                let d = document.createElement('div');
+                d.textContent = s;
+                return d.innerHTML;
+            }
+
+            function timeAgo(iso) {
+                if (!iso) return '';
+                let d = new Date(iso);
+                let now = new Date();
+                let diff = Math.floor((now - d) / 1000);
+                if (diff < 60) return 'just now';
+                if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+                if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+                if (diff < 2592000) return Math.floor(diff/86400) + 'd ago';
+                return d.toLocaleDateString();
+            }
+
+            loadSuggestions('votes');
+        </script>
+    </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 # ── Email Verification ────────────────────────────────────────────────────────
 
 @app.route("/auth/verify-email", methods=["GET"])
@@ -4133,6 +4620,25 @@ def migrate_auth():
             conn.execute(db.text(
                 "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS verification_token VARCHAR(100)"
             ))
+            conn.execute(db.text("""
+                CREATE TABLE IF NOT EXISTS suggestion (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    title VARCHAR(200) NOT NULL,
+                    description TEXT DEFAULT '',
+                    status VARCHAR(30) DEFAULT 'open',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(db.text("""
+                CREATE TABLE IF NOT EXISTS suggestion_vote (
+                    id SERIAL PRIMARY KEY,
+                    suggestion_id INTEGER NOT NULL REFERENCES suggestion(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL,
+                    vote INTEGER DEFAULT 1,
+                    UNIQUE(suggestion_id, user_id)
+                )
+            """))
             conn.commit()
         return "Auth migration successful (includes email verification columns)", 200
     except Exception as e:
