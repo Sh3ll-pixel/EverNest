@@ -2622,8 +2622,19 @@ def signup():
         return jsonify({"success": False, "message": f"Email max {INPUT_LIMITS['email']} characters"}), 400
     if len(password) > INPUT_LIMITS["password"]:
         return jsonify({"success": False, "message": f"Password max {INPUT_LIMITS['password']} characters"}), 400
+
+    # Password requirements
+    pw_errors = []
     if len(password) < 8:
-        return jsonify({"success": False, "message": "Password must be at least 8 characters"}), 400
+        pw_errors.append("at least 8 characters")
+    if not any(c.isupper() for c in password):
+        pw_errors.append("one uppercase letter")
+    if not any(c.islower() for c in password):
+        pw_errors.append("one lowercase letter")
+    if not any(c.isdigit() for c in password):
+        pw_errors.append("one number")
+    if pw_errors:
+        return jsonify({"success": False, "message": "Password needs: " + ", ".join(pw_errors)}), 400
 
     existing_user = User.query.filter(
         (User.username == username) | (User.email == email)
@@ -3511,8 +3522,17 @@ def reset_password():
     if not token or not password:
         return jsonify({"success": False, "message": "Token and password are required"}), 400
 
-    if len(password) < 6:
-        return jsonify({"success": False, "message": "Password must be at least 6 characters"}), 400
+    pw_errors = []
+    if len(password) < 8:
+        pw_errors.append("at least 8 characters")
+    if not any(c.isupper() for c in password):
+        pw_errors.append("one uppercase letter")
+    if not any(c.islower() for c in password):
+        pw_errors.append("one lowercase letter")
+    if not any(c.isdigit() for c in password):
+        pw_errors.append("one number")
+    if pw_errors:
+        return jsonify({"success": False, "message": "Password needs: " + ", ".join(pw_errors)}), 400
 
     user = User.query.filter_by(reset_token=token).first()
     if not user:
