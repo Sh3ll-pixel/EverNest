@@ -416,6 +416,24 @@ def email_password_reset(username, email, reset_url):
         """
     ))
 
+
+def email_verify_account(username, email, verify_url):
+    send_email(email, "Verify your EverNest account", _email_wrap(
+        f"Hey {username}, verify your email!",
+        f"""
+        <p style="color:#d1d5db;">Thanks for signing up for EverNest! Please verify your email address to activate your account.</p>
+        <p style="text-align:center;margin:24px 0;">
+            <a href="{verify_url}" style="background:#5b6ef7;color:#ffffff;padding:14px 32px;
+               border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px;">
+               Verify Email Address
+            </a>
+        </p>
+        <p style="color:#9ca3af;font-size:12px;">This link expires in 24 hours. If you didn't create this account, you can ignore this email.</p>
+        <p style="color:#4b5563;font-size:11px;">Or copy this link: {verify_url}</p>
+        """
+    ))
+
+
 # ── Database models ───────────────────────────────────────────────────────────
 class User(db.Model):
     id            = db.Column(db.Integer, primary_key=True)
@@ -433,6 +451,8 @@ class User(db.Model):
     profile_picture        = db.Column(db.Text, nullable=True)  # base64 JPEG, max ~200KB
     reset_token            = db.Column(db.String(100), nullable=True)
     reset_token_exp        = db.Column(db.DateTime, nullable=True)
+    email_verified         = db.Column(db.Boolean, default=False)
+    verification_token     = db.Column(db.String(100), nullable=True)
 
 
 def find_user_by_id(user_id):
@@ -2597,14 +2617,22 @@ def signup():
         return jsonify({"success": False, "message": "User already exists"}), 409
 
     password_hash = bcrypt.generate_password_hash(password).decode("utf-8")
-    new_user = User(username=username, email=email, password_hash=password_hash)
+    verify_token = secrets.token_urlsafe(32)
+    new_user = User(
+        username=username, email=email, password_hash=password_hash,
+        email_verified=False, verification_token=verify_token,
+    )
     db.session.add(new_user)
     db.session.commit()
 
-    token = generate_token(new_user.id)
+    verify_url = f"https://evernest-swz9.onrender.com/auth/verify-email?token={verify_token}"
     print(f"[AUDIT] SIGNUP | user={username} | email={email} | ip={request.remote_addr}")
-    email_welcome(username, email)
-    return jsonify({"success": True, "message": "Signup successful", "token": token}), 201
+    email_verify_account(username, email, verify_url)
+    return jsonify({
+        "success": True,
+        "message": "Account created! Check your email to verify your account.",
+        "needs_verification": True,
+    }), 201
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -2639,6 +2667,18 @@ def login():
         if remaining <= 2:
             msg += f" ({remaining} attempts remaining)"
         return jsonify({"success": False, "message": msg}), 401
+
+    # Check email verification (graceful for legacy users without the column)
+    try:
+        if hasattr(user, 'email_verified') and user.email_verified == False:
+            return jsonify({
+                "success": False,
+                "message": "Please verify your email before logging in. Check your inbox.",
+                "needs_verification": True,
+                "email": user.email,
+            }), 403
+    except Exception:
+        pass  # Column may not exist yet — allow login
 
     # Success — clear failed attempts
     _clear_login_attempts(login_value)
@@ -2782,6 +2822,83 @@ def admin_change_email():
     db.session.commit()
     print(f"[AUDIT] ADMIN_CHANGE_EMAIL | user_id={user_id} | old={old_email} | new={new_email} | ip={request.remote_addr}")
     return jsonify({"success": True, "message": f"Email changed from {old_email} to {new_email}"})
+
+
+# ── Email Verification ────────────────────────────────────────────────────────
+
+@app.route("/auth/verify-email", methods=["GET"])
+def verify_email():
+    token = request.args.get("token", "")
+    if not token:
+        return "<h2>Invalid verification link.</h2>", 400
+
+    user = User.query.filter_by(verification_token=token).first()
+    if not user:
+        return "<h2>Invalid or expired verification link.</h2>", 404
+
+    user.email_verified = True
+    user.verification_token = None
+    db.session.commit()
+
+    print(f"[AUDIT] EMAIL_VERIFIED | user={user.username} | email={user.email}")
+    email_welcome(user.username, user.email)
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Email Verified — EverNest</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                   background: #0c0e14; color: #e5e7eb; display: flex;
+                   justify-content: center; align-items: center; min-height: 100vh; }
+            .card { background: #161a1f; border: 1px solid #2a2f38; border-radius: 16px;
+                    padding: 48px; text-align: center; max-width: 420px; }
+            .icon { font-size: 48px; margin-bottom: 16px; }
+            h1 { color: #4ade80; font-size: 24px; margin-bottom: 8px; }
+            p { color: #6b7280; font-size: 14px; line-height: 1.6; margin-bottom: 16px; }
+            .brand { color: #5b6ef7; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icon">&#10004;&#65039;</div>
+            <h1>Email Verified!</h1>
+            <p>Your email has been verified successfully. You can now log in to <span class="brand">EverNest</span>.</p>
+            <p style="color:#4b5563;font-size:12px;">You can close this page and open the app.</p>
+        </div>
+    </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/auth/resend-verification", methods=["POST"])
+def resend_verification():
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({"success": False, "message": "Email is required"}), 400
+
+    user = User.query.filter(db.func.lower(User.email) == email).first()
+    if not user:
+        # Don't reveal whether the email exists
+        return jsonify({"success": True, "message": "If that email exists, a verification link has been sent."})
+
+    if user.email_verified:
+        return jsonify({"success": True, "message": "Email is already verified. You can log in."})
+
+    # Generate new token
+    user.verification_token = secrets.token_urlsafe(32)
+    db.session.commit()
+
+    verify_url = f"https://evernest-swz9.onrender.com/auth/verify-email?token={user.verification_token}"
+    email_verify_account(user.username, user.email, verify_url)
+    print(f"[AUDIT] RESEND_VERIFICATION | email={email} | ip={request.remote_addr}")
+    return jsonify({"success": True, "message": "Verification email sent. Check your inbox."})
 
 
 # ── Password Reset ───────────────────────────────────────────────────────────
@@ -4010,8 +4127,14 @@ def migrate_auth():
             conn.execute(db.text(
                 "ALTER TABLE note ADD COLUMN IF NOT EXISTS family_shared BOOLEAN DEFAULT FALSE"
             ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT TRUE"
+            ))
+            conn.execute(db.text(
+                "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS verification_token VARCHAR(100)"
+            ))
             conn.commit()
-        return "Auth migration successful", 200
+        return "Auth migration successful (includes email verification columns)", 200
     except Exception as e:
         return str(e), 400
 
